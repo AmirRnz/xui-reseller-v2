@@ -120,6 +120,10 @@ type runtimeConfig struct {
 	Features map[string]bool   `json:"features"`
 	Text     map[string]string `json:"text"`
 }
+type accessRequestResponse struct {
+	Status        string `json:"status"`
+	NextRequestAt string `json:"next_request_at"`
+}
 
 var (
 	errPanelPrivateChat = errors.New("panel configuration requires a private chat")
@@ -226,6 +230,86 @@ func markup(rows ...[]telebot.Btn) *telebot.ReplyMarkup {
 func btn(label, data string) telebot.Btn {
 	return telebot.Btn{Text: label, Unique: callbackUnique, Data: data}
 }
+
+func mainMenuRows(runtime runtimeConfig, act actor) [][]telebot.Btn {
+	support := []telebot.Btn{btn(textOr(runtime.Text, "support_button", "🆘 پشتیبانی"), "support")}
+	if act.ApprovalStatus != "approved" {
+		rows := make([][]telebot.Btn, 0, 3)
+		if featureEnabled(runtime.Features, "trials_enabled") {
+			rows = append(rows, []telebot.Btn{btn(textOr(runtime.Text, "trial_button", "🧪 دریافت تست"), "plans|test")})
+		}
+		if act.ApprovalStatus == "pending" {
+			rows = append(rows, []telebot.Btn{btn(textOr(runtime.Text, "request_access_button", "📝 درخواست دسترسی نمایندگی"), "request-access")})
+		}
+		return append(rows, support)
+	}
+
+	rows := make([][]telebot.Btn, 0, 3)
+	shopping := make([]telebot.Btn, 0, 2)
+	if featureEnabled(runtime.Features, "trials_enabled") {
+		shopping = append(shopping, btn(textOr(runtime.Text, "trial_button", "🧪 تست رایگان"), "plans|test"))
+	}
+	if featureEnabled(runtime.Features, "purchases_enabled") {
+		shopping = append(shopping, btn(textOr(runtime.Text, "buy_button", "💼 خرید سرویس"), "plans|paid"))
+	}
+	if len(shopping) > 0 {
+		rows = append(rows, shopping)
+	}
+	account := []telebot.Btn{btn(textOr(runtime.Text, "services_button", "📋 سرویس‌های من"), "services")}
+	if featureEnabled(runtime.Features, "wallet_enabled") {
+		account = append(account, btn(textOr(runtime.Text, "wallet_button", "👛 کیف پول"), "wallet"))
+	}
+	rows = append(rows, account, support)
+	return rows
+}
+
+func walletMenuRows(runtime runtimeConfig) [][]telebot.Btn {
+	actions := []telebot.Btn{btn("گردش کیف پول", "ledger")}
+	if featureEnabled(runtime.Features, "topups_enabled") {
+		actions = append(actions, btn("شارژ کیف پول", "topup"))
+	}
+	return [][]telebot.Btn{actions, {btn("خانه", "home")}}
+}
+
+func supportMessage(runtime runtimeConfig) string {
+	support := strings.TrimSpace(runtime.Text["support_username"])
+	if support == "" {
+		return "برای پشتیبانی لطفا با ادمین در ارتباط باشید."
+	}
+	if !strings.HasPrefix(support, "@") {
+		support = "@" + support
+	}
+	return fmt.Sprintf("برای پشتیبانی لطفا با آی‌دی زیر در ارتباط باشید:\n%s", support)
+}
+
+func accessRequestMessage(act actor) string {
+	switch act.ApprovalStatus {
+	case "pending":
+		return "وضعیت حساب شما در انتظار تایید مدیر است. اگر هنوز درخواست دسترسی نداده‌اید، برای ثبت آن با پشتیبانی تماس بگیرید."
+	case "approved":
+		return "شما قبلا درخواست دسترسی داده‌اید یا تایید شده‌اید."
+	case "rejected":
+		return "درخواست دسترسی شما تایید نشده است. برای پیگیری با پشتیبانی ارتباط بگیرید."
+	default:
+		return "وضعیت دسترسی شما مشخص نیست. برای پیگیری با پشتیبانی ارتباط بگیرید."
+	}
+}
+
+func accessRequestResultMessage(result accessRequestResponse) (string, error) {
+	switch result.Status {
+	case "submitted":
+		return "✅ درخواست دسترسی شما ثبت شد و برای بررسی مدیر ارسال خواهد شد.", nil
+	case "already_pending":
+		message := "درخواست قبلی شما در انتظار بررسی مدیر است."
+		if next, err := time.Parse(time.RFC3339, result.NextRequestAt); err == nil {
+			message += " امکان ارسال یادآوری بعدی از " + next.UTC().Format("2006-01-02 15:04 UTC") + " وجود دارد."
+		}
+		return message, nil
+	default:
+		return "", fmt.Errorf("backend returned an unknown access request status")
+	}
+}
+
 func (a *botApp) show(c telebot.Context, what interface{}, opts ...interface{}) error {
 	token := callbackToken()
 	if c.Sender() != nil {
@@ -296,24 +380,13 @@ func (a *botApp) callbackData(userID int64, raw string) ([]string, bool) {
 }
 func (a *botApp) home(c telebot.Context, act actor, message string) error {
 	runtime := a.runtime(c, act.TelegramID)
-	rows := make([][]telebot.Btn, 0, 5)
-	if featureEnabled(runtime.Features, "purchases_enabled") {
-		rows = append(rows, []telebot.Btn{btn(textOr(runtime.Text, "buy_button", "🛍 خرید سرویس"), "plans|paid")})
-	}
-	if featureEnabled(runtime.Features, "trials_enabled") {
-		rows = append(rows, []telebot.Btn{btn(textOr(runtime.Text, "trial_button", "🧪 تست روزانه"), "plans|test")})
-	}
-	walletOn := featureEnabled(runtime.Features, "wallet_enabled")
-	topupsOn := featureEnabled(runtime.Features, "topups_enabled")
-	if walletOn {
-		rows = append(rows, []telebot.Btn{btn(textOr(runtime.Text, "wallet_button", "💳 کیف پول"), "wallet"), btn(textOr(runtime.Text, "ledger_button", "📒 گردش کیف پول"), "ledger")})
-	}
-	if topupsOn {
-		rows = append(rows, []telebot.Btn{btn(textOr(runtime.Text, "topup_button", "➕ شارژ کیف پول"), "topup")})
-	}
-	rows = append(rows, []telebot.Btn{btn(textOr(runtime.Text, "services_button", "📡 سرویس‌های من"), "services")})
+	rows := mainMenuRows(runtime, act)
 	if message == "صفحه اصلی" || message == "به پنل سرویس reseller خوش آمدید." {
-		message = textOr(runtime.Text, "home_title", message)
+		if act.ApprovalStatus == "approved" {
+			message = textOr(runtime.Text, "home_title", "👋 به پنل کاربری خوش آمدید\nسرویس وی‌پی‌ان خود را مدیریت کنید یا سرویس جدید خریداری نمایید.")
+		} else {
+			message = textOr(runtime.Text, "home_title", "👋 به ربات نمایندگی خوش آمدید\nبرای دسترسی به امکانات کامل خرید و مدیریت سرویس، لطفا درخواست دسترسی خود را ثبت کنید.")
+		}
 	}
 	return a.show(c, message, markup(rows...))
 }
@@ -358,6 +431,21 @@ func (a *botApp) callback(c telebot.Context) error {
 		return a.show(c, "مبلغ شارژ را به تومان وارد کنید.", markup([]telebot.Btn{btn("لغو", "home")}))
 	case "services":
 		return a.services(c, act)
+	case "support":
+		return a.show(c, supportMessage(a.runtime(c, act.TelegramID)), markup([]telebot.Btn{btn("بازگشت", "home")}))
+	case "request-access":
+		if act.Role != "reseller" || act.ApprovalStatus != "pending" {
+			return a.show(c, accessRequestMessage(act), markup([]telebot.Btn{btn("بازگشت", "home")}))
+		}
+		var result accessRequestResponse
+		if err := a.call(c, "POST", "/v1/reseller/access-requests", act.TelegramID, map[string]any{}, &result); err != nil {
+			return a.sendFailure(c, err)
+		}
+		message, err := accessRequestResultMessage(result)
+		if err != nil {
+			return a.sendFailure(c, err)
+		}
+		return a.show(c, message, markup([]telebot.Btn{btn("بازگشت", "home")}))
 	case "service":
 		if len(data) < 2 {
 			return a.homeFor(c, "شناسه سرویس نامعتبر است.")
@@ -787,11 +875,15 @@ func (a *botApp) cancelSubscription(c telebot.Context, act actor, id int64) erro
 	return a.show(c, "درخواست لغو ثبت شد و وضعیت پنل در حال تطبیق است.", markup([]telebot.Btn{btn("سرویس‌های من", "services"), btn("خانه", "home")}))
 }
 func (a *botApp) wallet(c telebot.Context, act actor) error {
+	features := a.runtime(c, act.TelegramID)
+	if !featureEnabled(features.Features, "wallet_enabled") {
+		return a.home(c, act, "کیف پول در حال حاضر غیرفعال است.")
+	}
 	var out map[string]any
 	if err := a.call(c, "GET", "/v1/wallet", act.TelegramID, nil, &out); err != nil {
 		return a.sendFailure(c, err)
 	}
-	return a.show(c, fmt.Sprintf("موجودی کیف پول: %v تومان", out["balance_toman"]), markup([]telebot.Btn{btn("گردش کیف پول", "ledger"), btn("شارژ کیف پول", "topup")}, []telebot.Btn{btn("خانه", "home")}))
+	return a.show(c, fmt.Sprintf("موجودی کیف پول: %v تومان", out["balance_toman"]), markup(walletMenuRows(features)...))
 }
 func (a *botApp) ledger(c telebot.Context, act actor) error {
 	var out []map[string]any
