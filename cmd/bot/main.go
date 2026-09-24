@@ -70,6 +70,26 @@ type receiptState struct {
 	Kind string
 	ID   int64
 }
+type activeReceipt struct {
+	ID        int64  `json:"id"`
+	Status    string `json:"status"`
+	Amount    int64  `json:"amount_toman"`
+	CreatedAt string `json:"created_at"`
+}
+type activeReceiptResponse struct {
+	PaymentIntent *activeReceipt `json:"payment_intent"`
+	Topup         *activeReceipt `json:"topup"`
+}
+type adminReviewItem struct {
+	ID             int64  `json:"id"`
+	AccountID      int64  `json:"account_id"`
+	ActorID        int64  `json:"actor_id"`
+	TelegramID     int64  `json:"telegram_id"`
+	Amount         int64  `json:"amount_toman"`
+	Status         string `json:"status"`
+	CreatedAt      string `json:"created_at"`
+	TelegramFileID string `json:"telegram_file_id"`
+}
 type subscription struct {
 	ID                int64    `json:"id"`
 	Email             string   `json:"email"`
@@ -390,7 +410,11 @@ func (a *botApp) callbackData(userID int64, raw string) ([]string, bool) {
 func (a *botApp) home(c telebot.Context, act actor, message string) error {
 	runtime := a.runtime(c, act.TelegramID)
 	rows := mainMenuRows(runtime, act)
-	if message == "صفحه اصلی" || message == "به پنل سرویس reseller خوش آمدید." {
+	homepage := message == "صفحه اصلی" || message == "به پنل سرویس reseller خوش آمدید."
+	if homepage {
+		if pending, err := a.activeReceipts(c, act.TelegramID); err == nil && len(pending) > 0 {
+			rows = append([][]telebot.Btn{{btn("🧾 ادامه پرداخت یا شارژ", "resume")}}, rows...)
+		}
 		if act.ApprovalStatus == "approved" {
 			message = textOr(runtime.Text, "home_title", "👋 به پنل کاربری خوش آمدید\nسرویس وی‌پی‌ان خود را مدیریت کنید یا سرویس جدید خریداری نمایید.")
 		} else {
@@ -440,6 +464,17 @@ func (a *botApp) callback(c telebot.Context) error {
 	case "home":
 		a.clearFlow(act.TelegramID)
 		return a.homeFor(c, "صفحه اصلی")
+	case "resume":
+		return a.showResumeMenu(c, act)
+	case "resume-receipt":
+		if len(data) < 3 {
+			return a.home(c, act, "شناسه فاکتور نامعتبر است.")
+		}
+		id, err := strconv.ParseInt(data[2], 10, 64)
+		if err != nil || id <= 0 {
+			return a.home(c, act, "شناسه فاکتور نامعتبر است.")
+		}
+		return a.resumeReceipt(c, act, data[1], id)
 	case "wallet":
 		return a.wallet(c, act)
 	case "ledger":
@@ -689,6 +724,37 @@ func (a *botApp) callback(c telebot.Context) error {
 			return a.homeFor(c, "این بخش در دسترس نیست.")
 		}
 		return a.showRefunds(c, act)
+	case "review-refund":
+		if !isAdmin(act) || len(data) < 2 {
+			return a.homeFor(c, "این بخش در دسترس نیست.")
+		}
+		id, e := strconv.ParseInt(data[1], 10, 64)
+		if e != nil || id <= 0 {
+			return a.home(c, act, "شناسه استرداد نامعتبر است.")
+		}
+		return a.reviewRefund(c, act, id)
+	case "reject-refund":
+		if !isAdmin(act) || len(data) < 2 {
+			return a.homeFor(c, "این بخش در دسترس نیست.")
+		}
+		id, e := strconv.ParseInt(data[1], 10, 64)
+		if e != nil || id <= 0 {
+			return a.home(c, act, "شناسه استرداد نامعتبر است.")
+		}
+		return a.show(c, fmt.Sprintf("رد درخواست استرداد شماره %d را تأیید می‌کنید؟", id), markup([]telebot.Btn{btn("بله، رد شود", fmt.Sprintf("confirm-refund-reject|%d", id))}, []telebot.Btn{btn("بازگشت", "refunds")}))
+	case "confirm-refund-reject":
+		if !isAdmin(act) || len(data) < 2 {
+			return a.homeFor(c, "این بخش در دسترس نیست.")
+		}
+		id, e := strconv.ParseInt(data[1], 10, 64)
+		if e != nil || id <= 0 {
+			return a.home(c, act, "شناسه استرداد نامعتبر است.")
+		}
+		path, ok := adminRefundRejectPath(id)
+		if !ok {
+			return a.home(c, act, "شناسه استرداد نامعتبر است.")
+		}
+		return a.adminAction(c, act, path)
 	case "pending", "pendingtopups":
 		if !isAdmin(act) {
 			return a.homeFor(c, "این بخش در دسترس نیست.")
@@ -719,6 +785,45 @@ func (a *botApp) callback(c telebot.Context) error {
 		path := fmt.Sprintf("/v1/payment-intents/%d/approve", id)
 		if data[0] == "approvetopup" {
 			path = fmt.Sprintf("/v1/wallet/topups/%d/approve", id)
+		}
+		return a.adminAction(c, act, path)
+	case "review-payment", "review-topup":
+		if !isAdmin(act) || len(data) < 2 {
+			return a.homeFor(c, "این بخش در دسترس نیست.")
+		}
+		id, e := strconv.ParseInt(data[1], 10, 64)
+		if e != nil || id <= 0 {
+			return a.home(c, act, "شناسه درخواست نامعتبر است.")
+		}
+		kind := "payment"
+		if data[0] == "review-topup" {
+			kind = "topup"
+		}
+		return a.reviewPendingItem(c, act, kind, id)
+	case "reject-payment", "reject-topup":
+		if !isAdmin(act) || len(data) < 2 {
+			return a.homeFor(c, "این بخش در دسترس نیست.")
+		}
+		id, e := strconv.ParseInt(data[1], 10, 64)
+		if e != nil || id <= 0 {
+			return a.home(c, act, "شناسه درخواست نامعتبر است.")
+		}
+		kind := "payment"
+		if data[0] == "reject-topup" {
+			kind = "topup"
+		}
+		return a.show(c, fmt.Sprintf("رد درخواست %s شماره %d را تأیید می‌کنید؟", kind, id), markup([]telebot.Btn{btn("بله، رد شود", fmt.Sprintf("confirm-review-reject|%s|%d", kind, id))}, []telebot.Btn{btn("بازگشت", fmt.Sprintf("review-%s|%d", kind, id))}))
+	case "confirm-review-reject":
+		if !isAdmin(act) || len(data) < 3 {
+			return a.homeFor(c, "این بخش در دسترس نیست.")
+		}
+		id, e := strconv.ParseInt(data[2], 10, 64)
+		if e != nil || id <= 0 {
+			return a.home(c, act, "شناسه درخواست نامعتبر است.")
+		}
+		path, ok := adminRejectPath(data[1], id)
+		if !ok {
+			return a.home(c, act, "نوع درخواست نامعتبر است.")
 		}
 		return a.adminAction(c, act, path)
 	case "config":
@@ -1048,15 +1153,30 @@ func (a *botApp) photo(c telebot.Context) error {
 	if c.Sender() == nil {
 		return nil
 	}
+	act, err := a.resolve(c)
+	if err != nil {
+		return a.sendFailure(c, err)
+	}
 	a.mu.Lock()
 	st, ok := a.receipts[c.Sender().ID]
 	a.mu.Unlock()
 	if !ok {
-		return a.homeFor(c, "ابتدا از داخل فاکتور یا درخواست شارژ، ارسال عکس رسید را انتخاب کنید.")
-	}
-	act, err := a.resolve(c)
-	if err != nil {
-		return a.sendFailure(c, err)
+		active, activeErr := a.activeReceiptDetails(c, act.TelegramID)
+		if activeErr != nil {
+			return a.sendFailure(c, activeErr)
+		}
+		candidates := receiptCandidatesForPhoto(active)
+		switch len(candidates) {
+		case 0:
+			return a.show(c, "فاکتور منتظر رسید پیدا نشد. اگر فاکتور فعال دارید از گزینه ادامه پرداخت یا شارژ استفاده کنید.", markup([]telebot.Btn{btn("ادامه پرداخت یا شارژ", "resume")}, []telebot.Btn{btn("خانه", "home")}))
+		case 1:
+			st, ok = candidates[0], true
+			a.mu.Lock()
+			a.receipts[act.TelegramID] = st
+			a.mu.Unlock()
+		default:
+			return a.show(c, "چند فاکتور منتظر رسید دارید. ابتدا از منوی ادامه پرداخت یا شارژ فاکتور مربوطه را انتخاب کنید، سپس عکس را دوباره ارسال کنید.", markup([]telebot.Btn{btn("ادامه پرداخت یا شارژ", "resume")}))
+		}
 	}
 	msg := c.Message()
 	if msg == nil || msg.Photo == nil {
@@ -1286,9 +1406,9 @@ func (a *botApp) reviewReseller(c telebot.Context, act actor, telegramID int64, 
 }
 func (a *botApp) showPending(c telebot.Context, act actor, kind string) error {
 	path, label := "/v1/admin/payments", "پرداخت‌های منتظر"
-	action := "approve"
+	action := "review-payment"
 	if kind == "pendingtopups" {
-		path, label, action = "/v1/admin/topups", "شارژهای منتظر", "approvetopup"
+		path, label, action = "/v1/admin/topups", "شارژهای منتظر", "review-topup"
 	}
 	var items []map[string]any
 	if err := a.call(c, "GET", path, act.TelegramID, nil, &items); err != nil {
@@ -1300,7 +1420,7 @@ func (a *botApp) showPending(c telebot.Context, act actor, kind string) error {
 	rows := make([][]telebot.Btn, 0, len(items)+1)
 	for _, item := range items {
 		id := fmt.Sprint(item["id"])
-		rows = append(rows, []telebot.Btn{btn(fmt.Sprintf("%s · %v تومان", id, item["amount_toman"]), action+"|"+id)})
+		rows = append(rows, []telebot.Btn{btn(fmt.Sprintf("بررسی رسید #%s · %v تومان", id, item["amount_toman"]), action+"|"+id)})
 	}
 	rows = append(rows, []telebot.Btn{btn("مدیریت", "admin")})
 	return a.show(c, label, markup(rows...))

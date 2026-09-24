@@ -51,6 +51,74 @@ func TestTopupRetryKeepsTheOriginalAmountAndIdempotencyKey(t *testing.T) {
 	}
 }
 
+func TestActiveReceiptResponsesRecoverPendingPaymentAndTopup(t *testing.T) {
+	active := activeReceiptStates(activeReceiptResponse{
+		PaymentIntent: &activeReceipt{ID: 11, Status: "awaiting_receipt", Amount: 90000},
+		Topup:         &activeReceipt{ID: 12, Status: "receipt_submitted", Amount: 50000},
+	})
+	if len(active) != 2 || active[0] != (receiptState{Kind: "payment", ID: 11}) || active[1] != (receiptState{Kind: "topup", ID: 12}) {
+		t.Fatalf("recovered receipts = %#v", active)
+	}
+	if got := activeReceiptStates(activeReceiptResponse{}); len(got) != 0 {
+		t.Fatalf("empty active receipt response = %#v", got)
+	}
+}
+
+func TestPhotoRecoveryAfterRestartUsesBackendActiveRequests(t *testing.T) {
+	app := &botApp{receipts: map[int64]receiptState{}}
+	if len(app.receipts) != 0 {
+		t.Fatal("simulated restarted process should have no in-memory receipt state")
+	}
+	active := activeReceiptResponse{
+		PaymentIntent: &activeReceipt{ID: 11, Status: "awaiting_receipt"},
+		Topup:         &activeReceipt{ID: 12, Status: "receipt_submitted"},
+	}
+	got := receiptCandidatesForPhoto(active)
+	if len(got) != 1 || got[0] != (receiptState{Kind: "payment", ID: 11}) {
+		t.Fatalf("recoverable receipts = %#v; want only the awaiting payment intent", got)
+	}
+	active.Topup.Status = "awaiting_receipt"
+	if got = receiptCandidatesForPhoto(active); len(got) != 2 {
+		t.Fatalf("multiple awaiting receipts = %#v; want both to require explicit selection", got)
+	}
+}
+
+func TestAdminReviewRequiresReceiptEvidenceAndUsesScopedRejectPaths(t *testing.T) {
+	item := adminReviewItem{ID: 5, AccountID: 8, ActorID: 9, TelegramID: 96937669, Amount: 75000, Status: "receipt_submitted", CreatedAt: "2026-09-24T10:00:00Z", TelegramFileID: "private-file-id"}
+	if !hasAdminReviewEvidence(item) {
+		t.Fatal("receipt-submitted item with file evidence should permit review")
+	}
+	if strings.Contains(adminReviewSummary("payment", item), item.TelegramFileID) {
+		t.Fatal("admin summary must not expose Telegram file ID")
+	}
+	if !strings.Contains(adminReviewSummary("payment", item), "تلگرام 96937669") {
+		t.Fatal("admin summary should show backend-provided applicant Telegram ID")
+	}
+	item.TelegramFileID = ""
+	if hasAdminReviewEvidence(item) {
+		t.Fatal("item without receipt evidence must not permit approval")
+	}
+	item.TelegramID = 0
+	if got := adminReviewApplicant(item); !strings.Contains(got, "actor در backend") {
+		t.Fatalf("missing Telegram ID should be labeled as an internal actor ID, got %q", got)
+	}
+	for _, tc := range []struct{ kind, want string }{
+		{"payment", "/v1/payment-intents/5/reject"},
+		{"topup", "/v1/admin/topups/5/reject"},
+	} {
+		got, ok := adminRejectPath(tc.kind, 5)
+		if !ok || got != tc.want {
+			t.Errorf("adminRejectPath(%q) = %q, %t; want %q", tc.kind, got, ok, tc.want)
+		}
+	}
+	if _, ok := adminRejectPath("payment", 0); ok {
+		t.Fatal("invalid reject ID should be refused")
+	}
+	if got, ok := adminRefundRejectPath(5); !ok || got != "/v1/admin/refunds/5/reject" {
+		t.Fatalf("adminRefundRejectPath(5) = %q, %t", got, ok)
+	}
+}
+
 func TestPlanCardRendersLegacyPricingDescriptionAndDiscounts(t *testing.T) {
 	card := formatPlanDetails(plan{
 		Name: "Unlimited", Description: " مناسب برای استفاده روزمره ", BasePrice: 250000,
@@ -130,7 +198,7 @@ func TestTopupMinimumValidation(t *testing.T) {
 }
 
 func TestAdminCallbackRouteClassificationCoversPrivateAdminScreens(t *testing.T) {
-	for _, action := range []string{"admin", "pending", "pendingtopups", "resellers", "approve", "approvetopup", "work-items", "refunds", "config", "cfg", "cfgset", "planedit", "planfield", "feature"} {
+	for _, action := range []string{"admin", "pending", "pendingtopups", "resellers", "approve", "approvetopup", "review-payment", "review-topup", "reject-payment", "reject-topup", "confirm-review-reject", "review-refund", "reject-refund", "confirm-refund-reject", "work-items", "refunds", "config", "cfg", "cfgset", "planedit", "planfield", "feature"} {
 		if !adminCallbackAction(action) {
 			t.Errorf("admin route %q is not subject to private-chat gate", action)
 		}

@@ -12,11 +12,117 @@ import (
 
 func adminCallbackAction(action string) bool {
 	switch action {
-	case "admin", "pending", "pendingtopups", "resellers", "resapprove", "resreject", "approve", "approvetopup", "work-items", "refunds", "config", "cfg", "cfgset", "planedit", "planfield", "feature":
+	case "admin", "pending", "pendingtopups", "resellers", "resapprove", "resreject", "approve", "approvetopup", "review-payment", "review-topup", "reject-payment", "reject-topup", "confirm-review-reject", "review-refund", "reject-refund", "confirm-refund-reject", "work-items", "refunds", "config", "cfg", "cfgset", "planedit", "planfield", "feature":
 		return true
 	default:
 		return false
 	}
+}
+
+func (a *botApp) activeReceipts(c telebot.Context, actorID int64) ([]receiptState, error) {
+	result, err := a.activeReceiptDetails(c, actorID)
+	if err != nil {
+		return nil, err
+	}
+	return activeReceiptStates(result), nil
+}
+
+func activeReceiptStates(result activeReceiptResponse) []receiptState {
+	active := make([]receiptState, 0, 2)
+	if result.PaymentIntent != nil && result.PaymentIntent.ID > 0 {
+		active = append(active, receiptState{Kind: "payment", ID: result.PaymentIntent.ID})
+	}
+	if result.Topup != nil && result.Topup.ID > 0 {
+		active = append(active, receiptState{Kind: "topup", ID: result.Topup.ID})
+	}
+	return active
+}
+
+func receiptCandidatesForPhoto(active activeReceiptResponse) []receiptState {
+	candidates := make([]receiptState, 0, 2)
+	if active.PaymentIntent != nil && active.PaymentIntent.ID > 0 && active.PaymentIntent.Status == "awaiting_receipt" {
+		candidates = append(candidates, receiptState{Kind: "payment", ID: active.PaymentIntent.ID})
+	}
+	if active.Topup != nil && active.Topup.ID > 0 && active.Topup.Status == "awaiting_receipt" {
+		candidates = append(candidates, receiptState{Kind: "topup", ID: active.Topup.ID})
+	}
+	return candidates
+}
+
+func (a *botApp) activeReceiptDetails(c telebot.Context, actorID int64) (activeReceiptResponse, error) {
+	var payment struct {
+		PaymentIntent *activeReceipt `json:"payment_intent"`
+	}
+	var topup struct {
+		Topup *activeReceipt `json:"topup"`
+	}
+	if err := a.call(c, "GET", "/v1/payment-intents/active", actorID, nil, &payment); err != nil {
+		return activeReceiptResponse{}, err
+	}
+	if err := a.call(c, "GET", "/v1/wallet/topups/active", actorID, nil, &topup); err != nil {
+		return activeReceiptResponse{}, err
+	}
+	return activeReceiptResponse{PaymentIntent: payment.PaymentIntent, Topup: topup.Topup}, nil
+}
+
+func (a *botApp) showResumeMenu(c telebot.Context, act actor) error {
+	active, err := a.activeReceiptDetails(c, act.TelegramID)
+	if err != nil {
+		return a.sendFailure(c, err)
+	}
+	rows := make([][]telebot.Btn, 0, 3)
+	var text strings.Builder
+	text.WriteString("فاکتورهای فعال شما:\n")
+	found := false
+	needsReceipt := false
+	for _, item := range []struct {
+		kind  string
+		label string
+		value *activeReceipt
+	}{{"payment", "پرداخت سرویس", active.PaymentIntent}, {"topup", "شارژ کیف پول", active.Topup}} {
+		if item.value == nil || item.value.ID <= 0 {
+			continue
+		}
+		found = true
+		fmt.Fprintf(&text, "\n%s #%d · %s تومان · وضعیت: %s", item.label, item.value.ID, formatToman(item.value.Amount), item.value.Status)
+		if item.value.Status == "awaiting_receipt" {
+			needsReceipt = true
+			rows = append(rows, []telebot.Btn{btn("📷 ارسال رسید · "+item.label, fmt.Sprintf("resume-receipt|%s|%d", item.kind, item.value.ID))})
+		} else {
+			text.WriteString(" (رسید ارسال شده و در انتظار بررسی است)")
+		}
+	}
+	if !found {
+		return a.show(c, "فاکتور فعالی برای ادامه وجود ندارد.", markup([]telebot.Btn{btn("خانه", "home")}))
+	}
+	rows = append(rows, []telebot.Btn{btn("خانه", "home")})
+	if needsReceipt {
+		text.WriteString("\n\nبرای ادامه، رسید همان فاکتور را ارسال کنید.")
+	}
+	return a.show(c, strings.TrimSpace(text.String()), markup(rows...))
+}
+
+func (a *botApp) resumeReceipt(c telebot.Context, act actor, kind string, id int64) error {
+	active, err := a.activeReceiptDetails(c, act.TelegramID)
+	if err != nil {
+		return a.sendFailure(c, err)
+	}
+	var selected *activeReceipt
+	switch kind {
+	case "payment":
+		selected = active.PaymentIntent
+	case "topup":
+		selected = active.Topup
+	default:
+		return a.home(c, act, "نوع فاکتور نامعتبر است.")
+	}
+	if selected == nil || selected.ID != id || selected.Status != "awaiting_receipt" {
+		return a.show(c, "این فاکتور دیگر منتظر رسید نیست. وضعیت را از منوی ادامه فاکتور بررسی کنید.", markup([]telebot.Btn{btn("ادامه فاکتور", "resume")}, []telebot.Btn{btn("خانه", "home")}))
+	}
+	a.mu.Lock()
+	a.receipts[act.TelegramID] = receiptState{Kind: kind, ID: id}
+	a.mu.Unlock()
+	return a.show(c, fmt.Sprintf("رسید فاکتور %d را به‌صورت عکس ارسال کنید. مبلغ: %s تومان.", id, formatToman(selected.Amount)), markup([]telebot.Btn{btn("لغو", "home")}))
 }
 
 func (a *botApp) currentPurchaseFlow(id int64, step string) (conversation, bool) {
@@ -303,11 +409,123 @@ func (a *botApp) showRefunds(c telebot.Context, act actor) error {
 	if len(items) == 0 {
 		return a.show(c, "درخواست استرداد معوقی وجود ندارد.", markup([]telebot.Btn{btn("مدیریت", "admin")}))
 	}
-	var text strings.Builder
+	rows := make([][]telebot.Btn, 0, len(items)+1)
 	for _, item := range items {
-		fmt.Fprintf(&text, "درخواست #%d · سرویس #%d · مبلغ پیشنهادی %s تومان (سقف %s)\nدلیل: %s\n\n", item.ID, item.SubscriptionID, formatToman(item.Suggested), formatToman(item.Cap), item.Reason)
+		rows = append(rows, []telebot.Btn{btn(fmt.Sprintf("استرداد #%d · %s تومان", item.ID, formatToman(item.Suggested)), fmt.Sprintf("review-refund|%d", item.ID))})
 	}
-	return a.show(c, strings.TrimSpace(text.String()), markup([]telebot.Btn{btn("مدیریت", "admin")}))
+	rows = append(rows, []telebot.Btn{btn("مدیریت", "admin")})
+	return a.show(c, "درخواست‌های استرداد معوق را برای مشاهده جزئیات انتخاب کنید.", markup(rows...))
+}
+
+func (a *botApp) reviewRefund(c telebot.Context, act actor, id int64) error {
+	var items []struct {
+		ID             int64  `json:"id"`
+		SubscriptionID int64  `json:"subscription_id"`
+		Status         string `json:"status"`
+		Suggested      int64  `json:"suggested_amount_toman"`
+		Cap            int64  `json:"refundable_cap_toman"`
+		Reason         string `json:"reason"`
+	}
+	if err := a.call(c, "GET", "/v1/admin/refunds", act.TelegramID, nil, &items); err != nil {
+		return a.sendFailure(c, err)
+	}
+	for _, item := range items {
+		if item.ID != id {
+			continue
+		}
+		text := fmt.Sprintf("درخواست استرداد #%d\nسرویس: #%d\nوضعیت: %s\nمبلغ پیشنهادی: %s تومان\nسقف مجاز: %s تومان\nدلیل: %s", item.ID, item.SubscriptionID, item.Status, formatToman(item.Suggested), formatToman(item.Cap), item.Reason)
+		return a.show(c, text, markup([]telebot.Btn{btn("رد درخواست", fmt.Sprintf("reject-refund|%d", item.ID))}, []telebot.Btn{btn("بازگشت", "refunds")}))
+	}
+	return a.show(c, "درخواست استرداد پیدا نشد یا قبلاً بررسی شده است.", markup([]telebot.Btn{btn("بازگشت", "refunds")}))
+}
+
+func (a *botApp) reviewPendingItem(c telebot.Context, act actor, kind string, id int64) error {
+	if !isPrivateChat(c.Chat()) || !isAdmin(act) {
+		return a.show(c, "بررسی رسید فقط در گفت‌وگوی خصوصی مدیر در دسترس است.")
+	}
+	path, label := "/v1/admin/payments", "پرداخت سرویس"
+	if kind == "topup" {
+		path, label = "/v1/admin/topups", "شارژ کیف پول"
+	} else if kind != "payment" {
+		return a.show(c, "نوع درخواست نامعتبر است.")
+	}
+	var items []adminReviewItem
+	if err := a.call(c, "GET", path, act.TelegramID, nil, &items); err != nil {
+		return a.sendFailure(c, err)
+	}
+	for _, item := range items {
+		if item.ID != id {
+			continue
+		}
+		text := adminReviewSummary(label, item)
+		hasEvidence := hasAdminReviewEvidence(item)
+		if hasEvidence {
+			caption := fmt.Sprintf("مدرک رسید · %s #%d · %s تومان · %s", label, item.ID, formatToman(item.Amount), adminReviewApplicant(item))
+			if err := c.Send(&telebot.Photo{File: telebot.File{FileID: item.TelegramFileID}, Caption: caption}); err != nil {
+				return a.show(c, "ارسال تصویر رسید به گفت‌وگوی خصوصی مدیر ناموفق بود؛ دکمه تأیید فعال نشده است.", markup([]telebot.Btn{btn("بازگشت", pendingMenuAction(kind))}))
+			}
+		} else {
+			text += "\n\nتصویر رسید در دسترس نیست؛ تأیید غیرفعال شد."
+		}
+		rows := [][]telebot.Btn{}
+		if hasEvidence {
+			approveAction := "approve"
+			if kind == "topup" {
+				approveAction = "approvetopup"
+			}
+			rows = append(rows, []telebot.Btn{btn("✅ تأیید پس از بررسی رسید", fmt.Sprintf("%s|%d", approveAction, item.ID))})
+		}
+		rows = append(rows, []telebot.Btn{btn("رد درخواست", fmt.Sprintf("reject-%s|%d", kind, item.ID))}, []telebot.Btn{btn("بازگشت", pendingMenuAction(kind))})
+		return a.show(c, text, markup(rows...))
+	}
+	return a.show(c, "درخواست پیدا نشد یا رسید آن قبلاً بررسی شده است.", markup([]telebot.Btn{btn("بازگشت", pendingMenuAction(kind))}))
+}
+
+func pendingMenuAction(kind string) string {
+	if kind == "topup" {
+		return "pendingtopups"
+	}
+	return "pending"
+}
+
+func adminReviewSummary(label string, item adminReviewItem) string {
+	return fmt.Sprintf("%s · درخواست #%d\nحساب: #%d\nدرخواست‌کننده: %s\nمبلغ: %s تومان\nوضعیت: %s\nزمان: %s", label, item.ID, item.AccountID, adminReviewApplicant(item), formatToman(item.Amount), item.Status, item.CreatedAt)
+}
+
+func adminReviewApplicant(item adminReviewItem) string {
+	if item.TelegramID > 0 {
+		return fmt.Sprintf("تلگرام %d", item.TelegramID)
+	}
+	return fmt.Sprintf("شناسه actor در backend #%d", item.ActorID)
+}
+
+func adminReviewNeedsReceipt(item adminReviewItem) bool {
+	return item.Status == "receipt_submitted"
+}
+
+func hasAdminReviewEvidence(item adminReviewItem) bool {
+	return strings.TrimSpace(item.TelegramFileID) != "" && adminReviewNeedsReceipt(item)
+}
+
+func adminRejectPath(kind string, id int64) (string, bool) {
+	if id <= 0 {
+		return "", false
+	}
+	switch kind {
+	case "payment":
+		return fmt.Sprintf("/v1/payment-intents/%d/reject", id), true
+	case "topup":
+		return fmt.Sprintf("/v1/admin/topups/%d/reject", id), true
+	default:
+		return "", false
+	}
+}
+
+func adminRefundRejectPath(id int64) (string, bool) {
+	if id <= 0 {
+		return "", false
+	}
+	return fmt.Sprintf("/v1/admin/refunds/%d/reject", id), true
 }
 
 func formatPlanDetails(p plan, kind string) string {
