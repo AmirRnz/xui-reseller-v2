@@ -206,12 +206,17 @@ func TestAttemptKeyIsStableForRetriesAndFreshForNewUpdate(t *testing.T) {
 
 func TestCallbackDataRejectsStaleMenuVersions(t *testing.T) {
 	app := &botApp{menus: map[int64]string{41: "current-token"}}
-	parts, valid := app.callbackData(41, "trial|7|vcurrent-token")
-	if !valid || len(parts) != 2 || parts[0] != "trial" || parts[1] != "7" {
-		t.Fatalf("current callback = %#v, valid=%t", parts, valid)
+	for _, raw := range []string{"trial|7|vcurrent-token", "\fgo|trial|7|vcurrent-token"} {
+		parts, valid := app.callbackData(41, raw)
+		if !valid || len(parts) != 2 || parts[0] != "trial" || parts[1] != "7" {
+			t.Fatalf("current callback %q = %#v, valid=%t", raw, parts, valid)
+		}
 	}
 	if _, valid := app.callbackData(41, "trial|7|vprevious-token"); valid {
 		t.Fatal("callback from a previous screen must be rejected")
+	}
+	if _, valid := app.callbackData(41, "\fother|trial|7|vcurrent-token"); valid {
+		t.Fatal("callback with a different telebot unique name must be rejected")
 	}
 	if _, valid := app.callbackData(41, "trial|7"); valid {
 		t.Fatal("callback without a screen token must be rejected")
@@ -220,6 +225,22 @@ func TestCallbackDataRejectsStaleMenuVersions(t *testing.T) {
 	bindMenuToken(keyboard, "current-token")
 	if got := keyboard.InlineKeyboard[0][0].Data; got != "trial|7|vcurrent-token" {
 		t.Fatalf("bound callback = %q", got)
+	}
+}
+
+func TestTelebotCallbackUniqueDispatchStripsWirePrefix(t *testing.T) {
+	bot, err := telebot.NewBot(telebot.Settings{Offline: true, Synchronous: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got string
+	registerCallbackHandlers(bot, func(c telebot.Context) error {
+		got = c.Data()
+		return nil
+	})
+	bot.ProcessUpdate(telebot.Update{Callback: &telebot.Callback{Data: "\fgo|trial|7|vcurrent-token"}})
+	if got != "trial|7|vcurrent-token" {
+		t.Fatalf("callback payload = %q; want the unique prefix stripped", got)
 	}
 }
 

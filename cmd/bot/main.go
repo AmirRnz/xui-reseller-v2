@@ -23,6 +23,7 @@ import (
 )
 
 const adminTelegramID int64 = 96937669
+const callbackUnique = "go"
 
 type actor struct {
 	TelegramID     int64  `json:"telegram_id"`
@@ -176,7 +177,18 @@ func (a *botApp) register(b *telebot.Bot) {
 		}
 		return a.home(c, act, "به پنل سرویس reseller خوش آمدید.")
 	})
-	b.Handle(telebot.OnCallback, a.callback)
+	b.Handle("/admin", func(c telebot.Context) error {
+		a.clearFlow(c.Sender().ID)
+		act, err := a.resolve(c)
+		if err != nil {
+			return a.sendFailure(c, err)
+		}
+		if !isAdmin(act) {
+			return a.show(c, "این بخش در دسترس نیست.")
+		}
+		return a.adminHome(c, act)
+	})
+	registerCallbackHandlers(b, a.callback)
 	b.Handle(telebot.OnText, a.text)
 	b.Handle(telebot.OnPhoto, a.photo)
 }
@@ -191,6 +203,11 @@ func (a *botApp) resolve(c telebot.Context) (actor, error) {
 	return out, err
 }
 func isAdmin(act actor) bool { return act.TelegramID == adminTelegramID && act.Role == "admin" }
+func registerCallbackHandlers(b *telebot.Bot, handler telebot.HandlerFunc) {
+	callbackEndpoint := telebot.Btn{Unique: callbackUnique}
+	b.Handle(&callbackEndpoint, handler)
+	b.Handle(telebot.OnCallback, handler)
+}
 func markup(rows ...[]telebot.Btn) *telebot.ReplyMarkup {
 	m := &telebot.ReplyMarkup{}
 	converted := make([]telebot.Row, 0, len(rows))
@@ -200,7 +217,9 @@ func markup(rows ...[]telebot.Btn) *telebot.ReplyMarkup {
 	m.Inline(converted...)
 	return m
 }
-func btn(label, data string) telebot.Btn { return telebot.Btn{Text: label, Unique: "go", Data: data} }
+func btn(label, data string) telebot.Btn {
+	return telebot.Btn{Text: label, Unique: callbackUnique, Data: data}
+}
 func (a *botApp) show(c telebot.Context, what interface{}, opts ...interface{}) error {
 	token := callbackToken()
 	if c.Sender() != nil {
@@ -247,6 +266,15 @@ func callbackToken() string {
 	return hex.EncodeToString(sum[:6])
 }
 func (a *botApp) callbackData(userID int64, raw string) ([]string, bool) {
+	// Telegram sends the callback unique name as a control-prefixed first field.
+	// telebot normally removes it only when a handler is registered for that
+	// unique name; the catch-all callback handler can receive the wire form.
+	prefix := "\f" + callbackUnique + "|"
+	if strings.HasPrefix(raw, prefix) {
+		raw = strings.TrimPrefix(raw, prefix)
+	} else if strings.HasPrefix(raw, "\f") {
+		return nil, false
+	}
 	parts := strings.Split(raw, "|")
 	if len(parts) < 2 || !strings.HasPrefix(parts[len(parts)-1], "v") {
 		return nil, false
@@ -278,9 +306,6 @@ func (a *botApp) home(c telebot.Context, act actor, message string) error {
 		rows = append(rows, []telebot.Btn{btn(textOr(runtime.Text, "topup_button", "➕ شارژ کیف پول"), "topup")})
 	}
 	rows = append(rows, []telebot.Btn{btn(textOr(runtime.Text, "services_button", "📡 سرویس‌های من"), "services")})
-	if isAdmin(act) {
-		rows = append(rows, []telebot.Btn{btn(textOr(runtime.Text, "admin_button", "⚙️ مدیریت مدیر"), "admin")})
-	}
 	if message == "صفحه اصلی" || message == "به پنل سرویس reseller خوش آمدید." {
 		message = textOr(runtime.Text, "home_title", message)
 	}
