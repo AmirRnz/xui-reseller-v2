@@ -135,6 +135,25 @@ func TestAdminGateRequiresConfiguredIDAndBackendRole(t *testing.T) {
 	}
 }
 
+func TestAdminMenuRequiresPrivateChat(t *testing.T) {
+	admin := actor{TelegramID: adminTelegramID, Role: "admin"}
+	for name, chat := range map[string]*telebot.Chat{
+		"private":    {Type: telebot.ChatPrivate},
+		"group":      {Type: telebot.ChatGroup},
+		"supergroup": {Type: telebot.ChatSuperGroup},
+		"missing":    nil,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := canOpenAdmin(chat, admin); got != (name == "private") {
+				t.Fatalf("canOpenAdmin = %t for %s chat", got, name)
+			}
+		})
+	}
+	if canOpenAdmin(&telebot.Chat{Type: telebot.ChatPrivate}, actor{TelegramID: adminTelegramID, Role: "reseller"}) {
+		t.Fatal("private-chat access must still require the backend admin role")
+	}
+}
+
 func TestPanelConfigRequiresPrivateChat(t *testing.T) {
 	for name, chat := range map[string]*telebot.Chat{
 		"private":    {Type: telebot.ChatPrivate},

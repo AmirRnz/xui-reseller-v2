@@ -178,12 +178,15 @@ func (a *botApp) register(b *telebot.Bot) {
 		return a.home(c, act, "به پنل سرویس reseller خوش آمدید.")
 	})
 	b.Handle("/admin", func(c telebot.Context) error {
+		if !isPrivateChat(c.Chat()) {
+			return c.Send("دستور مدیریت فقط در گفت‌وگوی خصوصی در دسترس است.")
+		}
 		a.clearFlow(c.Sender().ID)
 		act, err := a.resolve(c)
 		if err != nil {
 			return a.sendFailure(c, err)
 		}
-		if !isAdmin(act) {
+		if !canOpenAdmin(c.Chat(), act) {
 			return a.show(c, "این بخش در دسترس نیست.")
 		}
 		return a.adminHome(c, act)
@@ -203,6 +206,9 @@ func (a *botApp) resolve(c telebot.Context) (actor, error) {
 	return out, err
 }
 func isAdmin(act actor) bool { return act.TelegramID == adminTelegramID && act.Role == "admin" }
+func canOpenAdmin(chat *telebot.Chat, act actor) bool {
+	return isPrivateChat(chat) && isAdmin(act)
+}
 func registerCallbackHandlers(b *telebot.Bot, handler telebot.HandlerFunc) {
 	callbackEndpoint := telebot.Btn{Unique: callbackUnique}
 	b.Handle(&callbackEndpoint, handler)
