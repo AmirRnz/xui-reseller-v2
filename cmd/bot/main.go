@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -18,43 +19,89 @@ import (
 	"gopkg.in/telebot.v3"
 )
 
+const adminTelegramID int64 = 96937669
+
 type actor struct {
 	TelegramID     int64  `json:"telegram_id"`
 	Role           string `json:"role"`
 	ApprovalStatus string `json:"approval_status"`
 }
 type plan struct {
-	ID            int64  `json:"id"`
-	Name          string `json:"name"`
-	Kind          string `json:"kind"`
-	IsLimited     bool   `json:"is_limited"`
-	BasePrice     int64  `json:"base_price_toman"`
-	PriceGB       int64  `json:"price_per_gb_toman"`
-	MinGB         int    `json:"min_data_gb"`
-	BaseIP        int    `json:"base_ip_limit"`
-	MaxIP         int    `json:"max_ip_limit"`
-	MaxBytes      int64  `json:"max_data_bytes"`
-	ExpireSeconds int64  `json:"expire_seconds"`
+	ID               int64  `json:"id"`
+	Name             string `json:"name"`
+	Kind             string `json:"kind"`
+	Enabled          bool   `json:"enabled"`
+	IsLimited        bool   `json:"is_limited"`
+	Description      string `json:"description"`
+	BasePrice        int64  `json:"base_price_toman"`
+	PriceExtraIP     int64  `json:"price_per_extra_ip_toman"`
+	PriceGB          int64  `json:"price_per_gb_toman"`
+	PriceExtraMonth  int64  `json:"price_per_extra_month_toman"`
+	BaseIP           int    `json:"base_ip_limit"`
+	MaxIP            int    `json:"max_ip_limit"`
+	MinGB            int    `json:"min_data_gb"`
+	MaxBytes         int64  `json:"max_data_bytes"`
+	ExpireSeconds    int64  `json:"expire_seconds"`
+	TestIPLimit      int    `json:"test_ip_limit"`
+	MaxPerDay        int    `json:"max_per_day"`
+	Flow             string `json:"flow"`
+	InboundIDs       []int  `json:"inbound_ids"`
+	UsageDescription string `json:"usage_description"`
 }
 type quote struct {
-	ID       int64  `json:"id"`
-	Price    int64  `json:"final_price_toman"`
-	Currency string `json:"currency"`
+	ID    int64 `json:"id"`
+	Price int64 `json:"final_price_toman"`
 }
 type purchase struct {
-	OrderID        int64  `json:"order_id"`
-	Status         string `json:"status"`
-	IntentID       int64  `json:"payment_intent_id"`
-	SubscriptionID int64  `json:"subscription_id"`
-	Amount         int64  `json:"amount_toman"`
+	Status   string `json:"status"`
+	IntentID int64  `json:"payment_intent_id"`
+	Amount   int64  `json:"amount_toman"`
 }
 type receiptState struct {
 	Kind string
 	ID   int64
 }
+type conversation struct {
+	Step    string
+	Vals    map[string]string
+	PlanID  int64
+	Method  string
+	Expires time.Time
+}
 type botApp struct {
-	api     *backend.Client
-	receipt sync.Map
+	api      *backend.Client
+	mu       sync.Mutex
+	flows    map[int64]conversation
+	receipts map[int64]receiptState
+}
+type settings struct {
+	RetailTrialResetDays      int               `json:"retail_trial_reset_days"`
+	UnapprovedTrialDailyLimit int               `json:"unapproved_trial_daily_limit"`
+	ResellerApprovedRequired  bool              `json:"reseller_approved_required"`
+	Features                  map[string]bool   `json:"features"`
+	Text                      map[string]string `json:"text"`
+}
+type paymentInstructions struct {
+	CardNumber   string `json:"card_number"`
+	CardOwner    string `json:"card_owner"`
+	Instructions string `json:"instructions"`
+}
+type panelConfig struct {
+	ID              int64  `json:"id"`
+	BaseURL         string `json:"base_url"`
+	TokenConfigured bool   `json:"token_configured"`
+}
+type adminConfig struct {
+	DeploymentID int64               `json:"deployment_id"`
+	Channel      string              `json:"channel"`
+	Plans        []plan              `json:"plans"`
+	Payment      paymentInstructions `json:"payment_instructions"`
+	Settings     settings            `json:"settings"`
+	Panel        panelConfig         `json:"panel"`
+}
+type runtimeConfig struct {
+	Features map[string]bool   `json:"features"`
+	Text     map[string]string `json:"text"`
 }
 
 func main() {
@@ -64,8 +111,7 @@ func main() {
 }
 func run() error {
 	token := strings.TrimSpace(os.Getenv("TELEGRAM_BOT_TOKEN"))
-	base := strings.TrimSpace(os.Getenv("BACKEND_URL"))
-	secret := os.Getenv("BACKEND_TOKEN")
+	base, secret := strings.TrimSpace(os.Getenv("BACKEND_URL")), os.Getenv("BACKEND_TOKEN")
 	if token == "" {
 		return fmt.Errorf("TELEGRAM_BOT_TOKEN is required")
 	}
@@ -83,8 +129,11 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	app := &botApp{api: api}
+	app := &botApp{api: api, flows: map[int64]conversation{}, receipts: map[int64]receiptState{}}
 	app.register(b)
+	if err := b.DeleteCommands(); err != nil {
+		log.Printf("could not clear Telegram command menu: %v", err)
+	}
 	done := make(chan struct{})
 	go func() { b.Start(); close(done) }()
 	signals := make(chan os.Signal, 1)
@@ -99,355 +148,1095 @@ func run() error {
 }
 func (a *botApp) register(b *telebot.Bot) {
 	b.Handle("/start", func(c telebot.Context) error {
+		a.clearFlow(c.Sender().ID)
 		act, err := a.resolve(c)
 		if err != nil {
 			return sendFailure(c, err)
 		}
-		return c.Send(fmt.Sprintf("سلام. حساب شما به backend مشترک متصل است. وضعیت حساب: %s. برای راهنما /help را بفرستید.", act.ApprovalStatus))
+		return a.home(c, act, "به پنل سرویس reseller خوش آمدید.")
 	})
-	b.Handle("/help", func(c telebot.Context) error {
-		return c.Send("دستورها:\n/plans — طرح‌های خرید\n/plans test — طرح‌های تست\n/trial <plan_id> — یک تست\n/buy <plan_id> <ماه> <IP> <GB> [نام] — پرداخت از کیف پول\n/pay <plan_id> <ماه> <IP> <GB> [نام] — پرداخت مستقیم\n/wallet و /ledger\n/topup <تومان> — درخواست شارژ\n/receipt <payment_intent_id> و سپس ارسال عکس رسید\n/topupreceipt <topup_id> و سپس ارسال عکس رسید\n/services و /cancel <subscription_id>")
-	})
-	b.Handle("/plans", a.plans)
-	b.Handle("/trial", a.trial)
-	b.Handle("/buy", func(c telebot.Context) error { return a.buy(c, "wallet") })
-	b.Handle("/pay", func(c telebot.Context) error { return a.buy(c, "direct") })
-	b.Handle("/wallet", a.wallet)
-	b.Handle("/ledger", a.ledger)
-	b.Handle("/topup", a.topup)
-	b.Handle("/receipt", func(c telebot.Context) error { return a.startReceipt(c, "payment") })
-	b.Handle("/topupreceipt", func(c telebot.Context) error { return a.startReceipt(c, "topup") })
-	b.Handle("/services", a.services)
-	b.Handle("/cancel", a.cancel)
-	b.Handle("/pending", a.pending)
-	b.Handle("/approve", a.approve)
-	b.Handle("/pendingtopups", a.pendingTopups)
-	b.Handle("/approvetopup", a.approveTopup)
+	b.Handle(telebot.OnCallback, a.callback)
+	b.Handle(telebot.OnText, a.text)
 	b.Handle(telebot.OnPhoto, a.photo)
 }
 func (a *botApp) resolve(c telebot.Context) (actor, error) {
-	id := c.Sender().ID
+	if c.Sender() == nil {
+		return actor{}, fmt.Errorf("فرستنده نامشخص است")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	var out actor
-	err := a.api.Call(ctx, "POST", "/v1/actors/resolve", 0, map[string]any{"telegram_id": id}, &out)
+	err := a.api.Call(ctx, "POST", "/v1/actors/resolve", c.Sender().ID, map[string]any{"telegram_id": c.Sender().ID}, &out)
 	return out, err
 }
-func (a *botApp) plans(c telebot.Context) error {
+func isAdmin(act actor) bool { return act.TelegramID == adminTelegramID && act.Role == "admin" }
+func markup(rows ...[]telebot.Btn) *telebot.ReplyMarkup {
+	m := &telebot.ReplyMarkup{}
+	converted := make([]telebot.Row, 0, len(rows))
+	for _, row := range rows {
+		converted = append(converted, telebot.Row(row))
+	}
+	m.Inline(converted...)
+	return m
+}
+func btn(label, data string) telebot.Btn { return telebot.Btn{Text: label, Unique: "go", Data: data} }
+func show(c telebot.Context, what interface{}, opts ...interface{}) error {
+	err := c.EditOrSend(what, opts...)
+	if err == nil {
+		return nil
+	}
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "message is not modified") || strings.Contains(message, "message to edit not found") || strings.Contains(message, "message can't be edited") {
+		return c.Send(what, opts...)
+	}
+	return err
+}
+func (a *botApp) home(c telebot.Context, act actor, message string) error {
+	runtime := a.runtime(c, act.TelegramID)
+	rows := make([][]telebot.Btn, 0, 5)
+	if featureEnabled(runtime.Features, "purchases_enabled") {
+		rows = append(rows, []telebot.Btn{btn(textOr(runtime.Text, "buy_button", "🛍 خرید سرویس"), "plans|paid")})
+	}
+	if featureEnabled(runtime.Features, "trials_enabled") {
+		rows = append(rows, []telebot.Btn{btn(textOr(runtime.Text, "trial_button", "🧪 تست روزانه"), "plans|test")})
+	}
+	walletOn := featureEnabled(runtime.Features, "wallet_enabled")
+	topupsOn := featureEnabled(runtime.Features, "topups_enabled")
+	if walletOn {
+		rows = append(rows, []telebot.Btn{btn(textOr(runtime.Text, "wallet_button", "💳 کیف پول"), "wallet"), btn(textOr(runtime.Text, "ledger_button", "📒 گردش کیف پول"), "ledger")})
+	}
+	if topupsOn {
+		rows = append(rows, []telebot.Btn{btn(textOr(runtime.Text, "topup_button", "➕ شارژ کیف پول"), "topup")})
+	}
+	rows = append(rows, []telebot.Btn{btn(textOr(runtime.Text, "services_button", "📡 سرویس‌های من"), "services")})
+	if isAdmin(act) {
+		rows = append(rows, []telebot.Btn{btn(textOr(runtime.Text, "admin_button", "⚙️ مدیریت مدیر"), "admin")})
+	}
+	if message == "صفحه اصلی" || message == "به پنل سرویس reseller خوش آمدید." {
+		message = textOr(runtime.Text, "home_title", message)
+	}
+	return show(c, message, markup(rows...))
+}
+func (a *botApp) runtime(c telebot.Context, actorID int64) runtimeConfig {
+	var cfg runtimeConfig
+	if err := a.call(c, "GET", "/v1/features", actorID, nil, &cfg); err != nil {
+		return runtimeConfig{}
+	}
+	return cfg
+}
+func textOr(values map[string]string, key, fallback string) string {
+	if value := strings.TrimSpace(values[key]); value != "" {
+		return value
+	}
+	return fallback
+}
+func (a *botApp) callback(c telebot.Context) error {
+	if err := c.Respond(); err != nil {
+		log.Printf("callback acknowledgement failed: %v", err)
+	}
+	if c.Sender() == nil {
+		return nil
+	}
+	if cb := c.Callback(); cb != nil && cb.Message != nil && time.Since(cb.Message.Time()) > 30*time.Minute {
+		return a.homeFor(c, "این صفحه قدیمی شده است. از منوی تازه استفاده کنید.")
+	}
+	data := strings.Split(c.Data(), "|")
+	if len(data) == 0 {
+		return a.homeFor(c, "دکمه نامعتبر است.")
+	}
 	act, err := a.resolve(c)
 	if err != nil {
 		return sendFailure(c, err)
 	}
-	kind := "paid"
-	if strings.Contains(strings.ToLower(c.Message().Text), "test") {
-		kind = "test"
+	switch data[0] {
+	case "home":
+		a.clearFlow(act.TelegramID)
+		return a.homeFor(c, "صفحه اصلی")
+	case "wallet":
+		return a.wallet(c, act)
+	case "ledger":
+		return a.ledger(c, act)
+	case "topup":
+		a.setFlow(act.TelegramID, conversation{Step: "topup", Expires: time.Now().Add(20 * time.Minute)})
+		return show(c, "مبلغ شارژ را به تومان وارد کنید.", markup([]telebot.Btn{btn("لغو", "home")}))
+	case "services":
+		return a.services(c, act)
+	case "plans":
+		if len(data) < 2 {
+			return a.homeFor(c, "انتخاب نامعتبر است.")
+		}
+		return a.showPlans(c, act, data[1])
+	case "trial":
+		if len(data) < 2 {
+			return a.homeFor(c, "انتخاب نامعتبر است.")
+		}
+		id, e := strconv.ParseInt(data[1], 10, 64)
+		if e != nil {
+			return a.homeFor(c, "طرح نامعتبر است.")
+		}
+		return a.submitTrial(c, act, id)
+	case "select":
+		if len(data) < 2 {
+			return a.homeFor(c, "انتخاب نامعتبر است.")
+		}
+		id, e := strconv.ParseInt(data[1], 10, 64)
+		if e != nil {
+			return a.homeFor(c, "طرح نامعتبر است.")
+		}
+		return a.startPurchase(c, act, id)
+	case "method":
+		if len(data) < 3 {
+			return a.homeFor(c, "انتخاب نامعتبر است.")
+		}
+		id, e := strconv.ParseInt(data[1], 10, 64)
+		if e != nil {
+			return a.homeFor(c, "طرح نامعتبر است.")
+		}
+		a.setFlow(act.TelegramID, conversation{Step: "months", PlanID: id, Method: data[2], Vals: map[string]string{}, Expires: time.Now().Add(20 * time.Minute)})
+		return show(c, "مدت اشتراک را به ماه وارد کنید.", markup([]telebot.Btn{btn("بازگشت", "plans|paid"), btn("خانه", "home")}))
+	case "receipt":
+		if len(data) < 3 {
+			return a.homeFor(c, "شناسه نامعتبر است.")
+		}
+		id, e := strconv.ParseInt(data[2], 10, 64)
+		if e != nil {
+			return a.homeFor(c, "شناسه نامعتبر است.")
+		}
+		a.mu.Lock()
+		a.receipts[act.TelegramID] = receiptState{Kind: data[1], ID: id}
+		a.mu.Unlock()
+		return show(c, "اکنون عکس رسید را ارسال کنید.", markup([]telebot.Btn{btn("لغو", "home")}))
+	case "cancel":
+		if len(data) < 2 {
+			return a.homeFor(c, "شناسه نامعتبر است.")
+		}
+		id, e := strconv.ParseInt(data[1], 10, 64)
+		if e != nil {
+			return a.homeFor(c, "شناسه نامعتبر است.")
+		}
+		return show(c, fmt.Sprintf("درخواست لغو سرویس %d را تأیید می‌کنید؟", id), markup([]telebot.Btn{btn("تأیید لغو", fmt.Sprintf("cancelconfirm|%d", id)), btn("بازگشت", "services")}, []telebot.Btn{btn("خانه", "home")}))
+	case "cancelconfirm":
+		if len(data) < 2 {
+			return a.home(c, act, "شناسه سرویس نامعتبر است.")
+		}
+		id, e := strconv.ParseInt(data[1], 10, 64)
+		if e != nil || id <= 0 {
+			return a.home(c, act, "شناسه سرویس نامعتبر است.")
+		}
+		return a.cancelSubscription(c, act, id)
+	case "admin":
+		if !isAdmin(act) {
+			return a.homeFor(c, "این بخش در دسترس نیست.")
+		}
+		return a.adminHome(c, act)
+	case "pending", "pendingtopups":
+		if !isAdmin(act) {
+			return a.homeFor(c, "این بخش در دسترس نیست.")
+		}
+		return a.showPending(c, act, data[0])
+	case "resellers":
+		if !isAdmin(act) {
+			return a.homeFor(c, "این بخش در دسترس نیست.")
+		}
+		return a.pendingResellers(c, act)
+	case "resapprove", "resreject":
+		if !isAdmin(act) || len(data) < 2 {
+			return a.homeFor(c, "این بخش در دسترس نیست.")
+		}
+		telegramID, e := strconv.ParseInt(data[1], 10, 64)
+		if e != nil || telegramID <= 0 {
+			return a.homeFor(c, "شناسه reseller نامعتبر است.")
+		}
+		return a.reviewReseller(c, act, telegramID, data[0])
+	case "approve", "approvetopup":
+		if !isAdmin(act) || len(data) < 2 {
+			return a.homeFor(c, "این بخش در دسترس نیست.")
+		}
+		id, e := strconv.ParseInt(data[1], 10, 64)
+		if e != nil {
+			return a.homeFor(c, "شناسه نامعتبر است.")
+		}
+		path := fmt.Sprintf("/v1/payment-intents/%d/approve", id)
+		if data[0] == "approvetopup" {
+			path = fmt.Sprintf("/v1/wallet/topups/%d/approve", id)
+		}
+		return a.adminAction(c, act, path)
+	case "config":
+		if !isAdmin(act) {
+			return a.homeFor(c, "این بخش در دسترس نیست.")
+		}
+		return a.showConfig(c, act)
+	case "cfg":
+		if !isAdmin(act) || len(data) < 2 {
+			return a.homeFor(c, "این بخش در دسترس نیست.")
+		}
+		return a.configSection(c, act, data[1])
+	case "cfgset":
+		if !isAdmin(act) || len(data) < 3 {
+			return a.homeFor(c, "این بخش در دسترس نیست.")
+		}
+		return a.startConfigEdit(c, act, data[1], data[2])
+	case "planedit":
+		if !isAdmin(act) || len(data) < 2 {
+			return a.homeFor(c, "این بخش در دسترس نیست.")
+		}
+		return a.planEditor(c, act, data[1])
+	case "planfield":
+		if !isAdmin(act) || len(data) < 3 {
+			return a.homeFor(c, "این بخش در دسترس نیست.")
+		}
+		return a.startPlanEdit(c, act, data[1], data[2])
+	case "feature":
+		if !isAdmin(act) || len(data) < 2 {
+			return a.homeFor(c, "این بخش در دسترس نیست.")
+		}
+		return a.toggleFeature(c, act, data[1])
+	default:
+		return a.homeFor(c, "این دکمه منقضی یا نامعتبر است.")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+}
+func (a *botApp) homeFor(c telebot.Context, msg string) error {
+	act, err := a.resolve(c)
+	if err != nil {
+		return sendFailure(c, err)
+	}
+	return a.home(c, act, msg)
+}
+func (a *botApp) showPlans(c telebot.Context, act actor, kind string) error {
+	if kind != "paid" && kind != "test" {
+		return a.home(c, act, "انتخاب نامعتبر است.")
+	}
 	var items []plan
-	if err = a.api.Call(ctx, "GET", "/v1/plans?kind="+kind, act.TelegramID, nil, &items); err != nil {
+	if err := a.call(c, "GET", "/v1/plans?kind="+kind, act.TelegramID, nil, &items); err != nil {
 		return sendFailure(c, err)
 	}
 	if len(items) == 0 {
-		return c.Send("در حال حاضر طرحی در دسترس نیست.")
+		return show(c, "در حال حاضر طرحی در دسترس نیست.", markup([]telebot.Btn{btn("خانه", "home")}))
 	}
-	var b strings.Builder
+	rows := make([][]telebot.Btn, 0, len(items)+1)
 	for _, p := range items {
+		label := p.Name
 		if kind == "test" {
-			fmt.Fprintf(&b, "🧪 %d — %s | مدت: %d ثانیه پس از اولین اتصال | حجم: %d بایت\n", p.ID, p.Name, p.ExpireSeconds, p.MaxBytes)
+			label = fmt.Sprintf("🧪 %s · تست روزانه", p.Name)
 		} else if p.IsLimited {
-			fmt.Fprintf(&b, "📦 %d — %s | هر گیگابایت: %d تومان | حداقل %dGB | IP: %d تا %d\n", p.ID, p.Name, p.PriceGB, p.MinGB, p.BaseIP, p.MaxIP)
+			label = fmt.Sprintf("%s · هر GB %d تومان", p.Name, p.PriceGB)
 		} else {
-			fmt.Fprintf(&b, "📦 %d — %s | پایه: %d تومان/ماه | IP: %d تا %d\n", p.ID, p.Name, p.BasePrice, p.BaseIP, p.MaxIP)
+			label = fmt.Sprintf("%s · پایه %d تومان/ماه", p.Name, p.BasePrice)
 		}
+		action := "select"
+		if kind == "test" {
+			action = "trial"
+		}
+		rows = append(rows, []telebot.Btn{btn(label, fmt.Sprintf("%s|%d", action, p.ID))})
 	}
-	return c.Send(strings.TrimSpace(b.String()))
+	rows = append(rows, []telebot.Btn{btn("خانه", "home")})
+	title := "طرح‌های خرید"
+	if kind == "test" {
+		title = "طرح‌های تست. هر درخواست یک کاربر است؛ تست گروهی غیرفعال است."
+	}
+	return show(c, title, markup(rows...))
 }
-func (a *botApp) trial(c telebot.Context) error {
-	act, err := a.resolve(c)
-	if err != nil {
-		return sendFailure(c, err)
-	}
-	args := arguments(c)
-	if len(args) != 1 {
-		return c.Send("استفاده: /trial <plan_id>")
-	}
-	planID, err := strconv.ParseInt(args[0], 10, 64)
-	if err != nil || planID <= 0 {
-		return c.Send("شناسه طرح نامعتبر است.")
-	}
-	key := stableKey(c.Sender().ID, c.Chat().ID, int64(c.Message().ID), "trial")
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
+func (a *botApp) submitTrial(c telebot.Context, act actor, id int64) error {
+	key := a.operationKey(c, fmt.Sprintf("trial-%d", id))
 	var out purchase
-	err = a.api.Call(ctx, "POST", "/v1/trials", act.TelegramID, map[string]any{"plan_id": planID, "idempotency_key": key}, &out)
-	if err != nil {
+	if err := a.call(c, "POST", "/v1/trials", act.TelegramID, map[string]any{"plan_id": id, "idempotency_key": key}, &out); err != nil {
 		return sendFailure(c, err)
 	}
-	return c.Send("درخواست تست به صورت پایدار ثبت شد؛ فعال‌سازی پس از تأیید پنل ادامه می‌یابد.")
+	return show(c, "درخواست تست ثبت شد و برای بررسی سهمیه روزانه و وضعیت تأیید reseller پردازش می‌شود.", markup([]telebot.Btn{btn("طرح‌های تست", "plans|test"), btn("خانه", "home")}))
 }
-func (a *botApp) buy(c telebot.Context, method string) error {
+func (a *botApp) startPurchase(c telebot.Context, act actor, id int64) error {
+	a.setFlow(act.TelegramID, conversation{Step: "method", PlanID: id, Vals: map[string]string{}, Expires: time.Now().Add(20 * time.Minute)})
+	runtime := a.runtime(c, act.TelegramID)
+	methods := []telebot.Btn{}
+	if featureEnabled(runtime.Features, "wallet_enabled") {
+		methods = append(methods, btn("پرداخت از کیف پول", "method|"+strconv.FormatInt(id, 10)+"|wallet"))
+	}
+	if featureEnabled(runtime.Features, "direct_payments_enabled") {
+		methods = append(methods, btn("پرداخت مستقیم", "method|"+strconv.FormatInt(id, 10)+"|direct"))
+	}
+	if len(methods) == 0 {
+		a.clearFlow(act.TelegramID)
+		return show(c, "روش پرداخت فعالی وجود ندارد.", markup([]telebot.Btn{btn("بازگشت", "plans|paid"), btn("خانه", "home")}))
+	}
+	return show(c, "روش پرداخت را انتخاب کنید.", markup(methods, []telebot.Btn{btn("بازگشت", "plans|paid"), btn("خانه", "home")}))
+}
+func (a *botApp) text(c telebot.Context) error {
+	if c.Sender() == nil {
+		return nil
+	}
+	raw := strings.TrimSpace(c.Text())
+	if strings.HasPrefix(raw, "/") {
+		return a.homeFor(c, "برای استفاده از منو دکمه‌ها را انتخاب کنید.")
+	}
 	act, err := a.resolve(c)
 	if err != nil {
 		return sendFailure(c, err)
 	}
-	args := arguments(c)
-	if len(args) < 4 || len(args) > 5 {
-		return c.Send("استفاده: /buy یا /pay <plan_id> <ماه> <IP> <GB> [نام]. برای طرح نامحدود GB را صفر بگذارید.")
+	a.mu.Lock()
+	st, ok := a.flows[act.TelegramID]
+	a.mu.Unlock()
+	if !ok || time.Now().After(st.Expires) {
+		a.clearFlow(act.TelegramID)
+		return a.home(c, act, "از منو گزینه‌ای را انتخاب کنید.")
 	}
-	planID, e1 := strconv.ParseInt(args[0], 10, 64)
-	months, e2 := strconv.Atoi(args[1])
-	ip, e3 := strconv.Atoi(args[2])
-	gb, e4 := strconv.Atoi(args[3])
-	if e1 != nil || e2 != nil || e3 != nil || e4 != nil {
-		return c.Send("پارامترهای خرید نامعتبر است.")
+	if raw == "لغو" {
+		a.clearFlow(act.TelegramID)
+		return a.home(c, act, "عملیات لغو شد.")
 	}
-	name := ""
-	if len(args) == 5 {
-		name = args[4]
+	switch st.Step {
+	case "months", "ip", "gb", "name":
+		if _, err := strconv.Atoi(raw); st.Step != "name" && err != nil {
+			return show(c, "لطفاً فقط عدد معتبر بفرستید.", markup([]telebot.Btn{btn("لغو", "home")}))
+		}
+		if st.Vals == nil {
+			st.Vals = map[string]string{}
+		}
+		st.Vals[st.Step] = raw
+		switch st.Step {
+		case "months":
+			st.Step = "ip"
+			return a.setFlowAndPrompt(c, act.TelegramID, st, "تعداد IP مجاز را وارد کنید.")
+		case "ip":
+			st.Step = "gb"
+			return a.setFlowAndPrompt(c, act.TelegramID, st, "حجم را بر حسب GB وارد کنید؛ برای نامحدود عدد 0.")
+		case "gb":
+			st.Step = "name"
+			return a.setFlowAndPrompt(c, act.TelegramID, st, "نام سرویس را وارد کنید؛ برای نام پیش‌فرض «-» بفرستید.")
+		}
+		name := raw
+		if name == "-" {
+			name = ""
+		}
+		a.clearFlow(act.TelegramID)
+		return a.createPurchase(c, act, st, name)
+	case "topup":
+		amount, e := strconv.ParseInt(raw, 10, 64)
+		if e != nil || amount <= 0 {
+			return show(c, "مبلغ را به تومان و به شکل عدد مثبت وارد کنید.", markup([]telebot.Btn{btn("لغو", "home")}))
+		}
+		a.clearFlow(act.TelegramID)
+		return a.createTopup(c, act, amount)
+	case "cancelid":
+		id, e := strconv.ParseInt(raw, 10, 64)
+		if e != nil || id <= 0 {
+			return show(c, "شناسه اشتراک معتبر وارد کنید.")
+		}
+		a.clearFlow(act.TelegramID)
+		return a.cancelSubscription(c, act, id)
+	case "cfgvalue":
+		if !isAdmin(act) {
+			return a.home(c, act, "این بخش در دسترس نیست.")
+		}
+		return a.saveConfigValue(c, act, st, raw)
+	case "cfgtextkey":
+		if !isAdmin(act) {
+			return a.home(c, act, "این بخش در دسترس نیست.")
+		}
+		if !validConfigKey(raw) {
+			return show(c, "کلید فقط می‌تواند شامل حروف کوچک انگلیسی، عدد و زیرخط باشد.", markup([]telebot.Btn{btn("لغو", "config")}))
+		}
+		st.Vals["field"] = raw
+		st.Step = "cfgvalue"
+		st.Expires = time.Now().Add(20 * time.Minute)
+		a.setFlow(act.TelegramID, st)
+		return show(c, "متن جدید را وارد کنید.", markup([]telebot.Btn{btn("لغو", "config")}))
+	case "paneltoken":
+		if !isAdmin(act) {
+			return a.home(c, act, "این بخش در دسترس نیست.")
+		}
+		defer c.Delete()
+		payload := map[string]string{"base_url": st.Vals["base_url"], "token": raw}
+		if err := a.call(c, "PUT", "/v1/admin/config/panel", act.TelegramID, payload, nil); err != nil {
+			a.clearFlow(act.TelegramID)
+			return sendFailure(c, err)
+		}
+		a.clearFlow(act.TelegramID)
+		return show(c, "تنظیمات پنل ذخیره شد.", markup([]telebot.Btn{btn("بازگشت", "config")}))
+	case "planvalue":
+		if !isAdmin(act) {
+			return a.home(c, act, "این بخش در دسترس نیست.")
+		}
+		return a.savePlanValue(c, act, st, raw)
+	case "plancreate":
+		if !isAdmin(act) {
+			return a.home(c, act, "این بخش در دسترس نیست.")
+		}
+		return a.collectNewPlan(c, act, st, raw)
+	default:
+		a.clearFlow(act.TelegramID)
+		return a.home(c, act, "ورودی منقضی شد. از منو دوباره شروع کنید.")
 	}
-	key := stableKey(c.Sender().ID, c.Chat().ID, int64(c.Message().ID), "purchase")
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
+}
+func (a *botApp) setFlowAndPrompt(c telebot.Context, id int64, st conversation, prompt string) error {
+	st.Expires = time.Now().Add(20 * time.Minute)
+	a.setFlow(id, st)
+	return show(c, prompt, markup([]telebot.Btn{btn("لغو", "home")}))
+}
+func (a *botApp) createPurchase(c telebot.Context, act actor, st conversation, name string) error {
+	vals := st.Vals
+	months, _ := strconv.Atoi(vals["months"])
+	ip, _ := strconv.Atoi(vals["ip"])
+	gb, _ := strconv.Atoi(vals["gb"])
+	key := a.operationKey(c, "purchase")
 	var q quote
-	err = a.api.Call(ctx, "POST", "/v1/quotes", act.TelegramID, map[string]any{"plan_id": planID, "months": months, "ip_limit": ip, "data_gb": gb, "idempotency_key": "quote-" + key}, &q)
-	if err != nil {
+	if err := a.call(c, "POST", "/v1/quotes", act.TelegramID, map[string]any{"plan_id": st.PlanID, "months": months, "ip_limit": ip, "data_gb": gb, "idempotency_key": "quote-" + key}, &q); err != nil {
 		return sendFailure(c, err)
 	}
 	var out purchase
-	err = a.api.Call(ctx, "POST", "/v1/purchases", act.TelegramID, map[string]any{"quote_id": q.ID, "payment_method": method, "idempotency_key": "purchase-" + key, "display_name": name}, &out)
-	if err != nil {
+	if err := a.call(c, "POST", "/v1/purchases", act.TelegramID, map[string]any{"quote_id": q.ID, "payment_method": st.Method, "idempotency_key": "purchase-" + key, "display_name": name}, &out); err != nil {
 		return sendFailure(c, err)
 	}
-	if method == "wallet" {
-		return c.Send(fmt.Sprintf("درخواست خرید ثبت شد. مبلغ %d تومان. وضعیت: %s.", out.Amount, out.Status))
+	if st.Method == "wallet" {
+		return show(c, fmt.Sprintf("خرید ثبت شد. مبلغ %d تومان؛ وضعیت: %s.", out.Amount, out.Status), markup([]telebot.Btn{btn("سرویس‌های من", "services"), btn("خانه", "home")}))
 	}
-	var instruction map[string]string
-	if err = a.api.Call(ctx, "GET", "/v1/payment-instructions", act.TelegramID, nil, &instruction); err != nil {
+	var instructions paymentInstructions
+	if err := a.call(c, "GET", "/v1/payment-instructions", act.TelegramID, nil, &instructions); err != nil {
 		return sendFailure(c, err)
 	}
-	text := fmt.Sprintf("فاکتور مستقیم شماره %d\nمبلغ: %d تومان\nشماره کارت: %s\nصاحب کارت: %s\n%s\nپس از پرداخت /receipt %d را بفرستید و عکس رسید را ارسال کنید.", out.IntentID, out.Amount, instruction["card_number"], instruction["card_owner"], instruction["instructions"], out.IntentID)
-	return c.Send(text)
+	return show(c, fmt.Sprintf("فاکتور شماره %d\nمبلغ: %d تومان\nشماره کارت: %s\nصاحب کارت: %s\n%s", out.IntentID, out.Amount, instructions.CardNumber, instructions.CardOwner, instructions.Instructions), markup([]telebot.Btn{btn("ارسال عکس رسید", fmt.Sprintf("receipt|payment|%d", out.IntentID))}, []telebot.Btn{btn("خانه", "home")}))
 }
-func (a *botApp) wallet(c telebot.Context) error {
-	act, err := a.resolve(c)
-	if err != nil {
-		return sendFailure(c, err)
-	}
+func (a *botApp) createTopup(c telebot.Context, act actor, amount int64) error {
 	var out map[string]any
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err = a.api.Call(ctx, "GET", "/v1/wallet", act.TelegramID, nil, &out); err != nil {
+	if err := a.call(c, "POST", "/v1/wallet/topups", act.TelegramID, map[string]any{"amount_toman": amount, "idempotency_key": a.operationKey(c, "topup")}, &out); err != nil {
 		return sendFailure(c, err)
 	}
-	return c.Send(fmt.Sprintf("موجودی کیف پول: %v تومان", out["balance_toman"]))
-}
-func (a *botApp) ledger(c telebot.Context) error {
-	act, err := a.resolve(c)
-	if err != nil {
-		return sendFailure(c, err)
-	}
-	var out []map[string]any
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err = a.api.Call(ctx, "GET", "/v1/wallet/ledger", act.TelegramID, nil, &out); err != nil {
-		return sendFailure(c, err)
-	}
-	if len(out) == 0 {
-		return c.Send("تراکنشی ثبت نشده است.")
-	}
-	var b strings.Builder
-	for _, row := range out {
-		fmt.Fprintf(&b, "%v تومان | %v | %v\n", row["amount_toman"], row["type"], row["description"])
-	}
-	return c.Send(strings.TrimSpace(b.String()))
-}
-func (a *botApp) topup(c telebot.Context) error {
-	act, err := a.resolve(c)
-	if err != nil {
-		return sendFailure(c, err)
-	}
-	args := arguments(c)
-	if len(args) != 1 {
-		return c.Send("استفاده: /topup <مبلغ به تومان>")
-	}
-	amount, err := strconv.ParseInt(args[0], 10, 64)
-	if err != nil {
-		return c.Send("مبلغ نامعتبر است.")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	var out map[string]any
-	err = a.api.Call(ctx, "POST", "/v1/wallet/topups", act.TelegramID, map[string]any{"amount_toman": amount, "idempotency_key": stableKey(c.Sender().ID, c.Chat().ID, int64(c.Message().ID), "topup")}, &out)
-	if err != nil {
-		return sendFailure(c, err)
-	}
-	return c.Send(fmt.Sprintf("درخواست شارژ شماره %v ثبت شد. پس از واریز /topupreceipt %v را بفرستید و عکس رسید را ارسال کنید.", out["topup_id"], out["topup_id"]))
-}
-func (a *botApp) startReceipt(c telebot.Context, kind string) error {
-	args := arguments(c)
-	if len(args) != 1 {
-		return c.Send("شناسه درخواست را وارد کنید.")
-	}
-	id, err := strconv.ParseInt(args[0], 10, 64)
-	if err != nil || id <= 0 {
-		return c.Send("شناسه نامعتبر است.")
-	}
-	a.receipt.Store(c.Sender().ID, receiptState{kind, id})
-	return c.Send("حالا عکس رسید را ارسال کنید.")
+	id := fmt.Sprint(out["topup_id"])
+	return show(c, "درخواست شارژ ثبت شد.", markup([]telebot.Btn{btn("ارسال عکس رسید", "receipt|topup|"+id)}, []telebot.Btn{btn("خانه", "home")}))
 }
 func (a *botApp) photo(c telebot.Context) error {
-	stateValue, ok := a.receipt.Load(c.Sender().ID)
-	if !ok {
-		return c.Send("برای ثبت رسید ابتدا /receipt یا /topupreceipt را همراه شناسه درخواست بفرستید.")
+	if c.Sender() == nil {
+		return nil
 	}
-	state := stateValue.(receiptState)
+	a.mu.Lock()
+	st, ok := a.receipts[c.Sender().ID]
+	a.mu.Unlock()
+	if !ok {
+		return a.homeFor(c, "ابتدا از داخل فاکتور یا درخواست شارژ، ارسال عکس رسید را انتخاب کنید.")
+	}
 	act, err := a.resolve(c)
 	if err != nil {
 		return sendFailure(c, err)
 	}
 	msg := c.Message()
 	if msg == nil || msg.Photo == nil {
-		return c.Send("عکس رسید دریافت نشد.")
+		return show(c, "عکس رسید دریافت نشد.")
 	}
-	path := fmt.Sprintf("/v1/payment-intents/%d/receipt", state.ID)
-	if state.Kind == "topup" {
-		path = fmt.Sprintf("/v1/wallet/topups/%d/receipt", state.ID)
+	path := fmt.Sprintf("/v1/payment-intents/%d/receipt", st.ID)
+	if st.Kind == "topup" {
+		path = fmt.Sprintf("/v1/wallet/topups/%d/receipt", st.ID)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	err = a.api.Call(ctx, "POST", path, act.TelegramID, map[string]any{"telegram_file_id": msg.Photo.FileID}, nil)
-	if err != nil {
+	if err = a.call(c, "POST", path, act.TelegramID, map[string]any{"telegram_file_id": msg.Photo.FileID}, nil); err != nil {
 		return sendFailure(c, err)
 	}
-	a.receipt.Delete(c.Sender().ID)
-	return c.Send("رسید ثبت شد و برای بررسی اپراتور در صف قرار گرفت.")
+	a.mu.Lock()
+	delete(a.receipts, act.TelegramID)
+	a.mu.Unlock()
+	return a.home(c, act, "رسید ثبت شد و برای بررسی قرار گرفت.")
 }
-func (a *botApp) services(c telebot.Context) error {
-	act, err := a.resolve(c)
-	if err != nil {
+func (a *botApp) cancelSubscription(c telebot.Context, act actor, id int64) error {
+	if err := a.call(c, "POST", fmt.Sprintf("/v1/subscriptions/%d/cancel", id), act.TelegramID, map[string]any{"idempotency_key": a.operationKey(c, fmt.Sprintf("cancel-%d", id))}, nil); err != nil {
 		return sendFailure(c, err)
 	}
+	return show(c, "درخواست لغو ثبت شد و وضعیت پنل در حال تطبیق است.", markup([]telebot.Btn{btn("سرویس‌های من", "services"), btn("خانه", "home")}))
+}
+func (a *botApp) wallet(c telebot.Context, act actor) error {
+	var out map[string]any
+	if err := a.call(c, "GET", "/v1/wallet", act.TelegramID, nil, &out); err != nil {
+		return sendFailure(c, err)
+	}
+	return show(c, fmt.Sprintf("موجودی کیف پول: %v تومان", out["balance_toman"]), markup([]telebot.Btn{btn("گردش کیف پول", "ledger"), btn("شارژ کیف پول", "topup")}, []telebot.Btn{btn("خانه", "home")}))
+}
+func (a *botApp) ledger(c telebot.Context, act actor) error {
 	var out []map[string]any
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err = a.api.Call(ctx, "GET", "/v1/subscriptions", act.TelegramID, nil, &out); err != nil {
+	if err := a.call(c, "GET", "/v1/wallet/ledger", act.TelegramID, nil, &out); err != nil {
 		return sendFailure(c, err)
 	}
 	if len(out) == 0 {
-		return c.Send("اشتراکی ثبت نشده است.")
+		return show(c, "تراکنشی ثبت نشده است.", markup([]telebot.Btn{btn("خانه", "home")}))
 	}
 	var b strings.Builder
+	for _, r := range out {
+		fmt.Fprintf(&b, "%v تومان · %v · %v\n", r["amount_toman"], r["type"], r["description"])
+	}
+	return show(c, strings.TrimSpace(b.String()), markup([]telebot.Btn{btn("کیف پول", "wallet"), btn("خانه", "home")}))
+}
+func (a *botApp) services(c telebot.Context, act actor) error {
+	var out []map[string]any
+	if err := a.call(c, "GET", "/v1/subscriptions", act.TelegramID, nil, &out); err != nil {
+		return sendFailure(c, err)
+	}
+	if len(out) == 0 {
+		return show(c, "اشتراکی ثبت نشده است.", markup([]telebot.Btn{btn("خرید سرویس", "plans|paid"), btn("خانه", "home")}))
+	}
+	rows := make([][]telebot.Btn, 0, len(out)+1)
 	for _, s := range out {
-		fmt.Fprintf(&b, "%v — %v — %v — %v\n", s["id"], s["display_name"], s["status"], s["email"])
+		label := fmt.Sprintf("%v · %v", s["display_name"], s["status"])
+		rows = append(rows, []telebot.Btn{btn(label, fmt.Sprintf("cancel|%v", s["id"]))})
 	}
-	return c.Send(strings.TrimSpace(b.String()))
-}
-func (a *botApp) cancel(c telebot.Context) error {
-	act, err := a.resolve(c)
-	if err != nil {
-		return sendFailure(c, err)
-	}
-	args := arguments(c)
-	if len(args) != 1 {
-		return c.Send("استفاده: /cancel <subscription_id>")
-	}
-	id, err := strconv.ParseInt(args[0], 10, 64)
-	if err != nil || id <= 0 {
-		return c.Send("شناسه اشتراک نامعتبر است.")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	var out map[string]any
-	err = a.api.Call(ctx, "POST", fmt.Sprintf("/v1/subscriptions/%d/cancel", id), act.TelegramID, map[string]any{"idempotency_key": stableKey(c.Sender().ID, c.Chat().ID, int64(c.Message().ID), "cancel")}, &out)
-	if err != nil {
-		return sendFailure(c, err)
-	}
-	return c.Send("درخواست لغو ثبت شد و وضعیت پنل در حال تطبیق است.")
+	rows = append(rows, []telebot.Btn{btn("خانه", "home")})
+	return show(c, "سرویس‌هایتان (برای لغو، سرویس را انتخاب کنید):", markup(rows...))
 }
 
-func (a *botApp) pending(c telebot.Context) error {
-	act, err := a.resolve(c)
-	if err != nil {
-		return sendFailure(c, err)
-	}
-	var out []map[string]any
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err = a.api.Call(ctx, "GET", "/v1/admin/payments", act.TelegramID, nil, &out); err != nil {
-		return sendFailure(c, err)
-	}
-	if len(out) == 0 {
-		return c.Send("پرداخت معوقی وجود ندارد.")
-	}
-	var b strings.Builder
-	for _, p := range out {
-		fmt.Fprintf(&b, "%v — %v تومان — /approve %v\n", p["id"], p["amount_toman"], p["id"])
-	}
-	return c.Send(strings.TrimSpace(b.String()))
+func (a *botApp) adminHome(c telebot.Context, act actor) error {
+	return show(c, "مدیریت فقط برای مدیر پیکربندی‌شده در این deployment در دسترس است.", markup([]telebot.Btn{btn("درخواست‌های reseller", "resellers")}, []telebot.Btn{btn("پرداخت‌های در انتظار", "pending"), btn("شارژهای در انتظار", "pendingtopups")}, []telebot.Btn{btn("تنظیمات ربات و طرح‌ها", "config")}, []telebot.Btn{btn("خانه", "home")}))
 }
-func (a *botApp) approve(c telebot.Context) error {
-	return a.adminAction(c, "approve", "/v1/payment-intents/%d/approve")
-}
-func (a *botApp) pendingTopups(c telebot.Context) error {
-	act, err := a.resolve(c)
-	if err != nil {
+func (a *botApp) pendingResellers(c telebot.Context, act actor) error {
+	var items []map[string]any
+	if err := a.call(c, "GET", "/v1/admin/resellers/pending", act.TelegramID, nil, &items); err != nil {
 		return sendFailure(c, err)
 	}
-	var out []map[string]any
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err = a.api.Call(ctx, "GET", "/v1/admin/topups", act.TelegramID, nil, &out); err != nil {
+	if len(items) == 0 {
+		return show(c, "درخواست تأیید reseller در انتظار نیست.", markup([]telebot.Btn{btn("مدیریت", "admin")}))
+	}
+	rows := make([][]telebot.Btn, 0, len(items)+1)
+	for _, item := range items {
+		id := fmt.Sprint(item["telegram_id"])
+		label := fmt.Sprintf("%s · %v", id, item["approval_status"])
+		rows = append(rows, []telebot.Btn{btn(label, "resapprove|"+id), btn("رد", "resreject|"+id)})
+	}
+	rows = append(rows, []telebot.Btn{btn("مدیریت", "admin")})
+	return show(c, "درخواست‌های reseller در همین deployment:", markup(rows...))
+}
+func (a *botApp) reviewReseller(c telebot.Context, act actor, telegramID int64, action string) error {
+	verb := "approve"
+	if action == "resreject" {
+		verb = "reject"
+	}
+	var out map[string]any
+	path := fmt.Sprintf("/v1/admin/resellers/%d/%s", telegramID, verb)
+	if err := a.call(c, "POST", path, act.TelegramID, map[string]any{}, &out); err != nil {
 		return sendFailure(c, err)
 	}
-	if len(out) == 0 {
-		return c.Send("درخواست شارژ معوقی وجود ندارد.")
-	}
-	var b strings.Builder
-	for _, p := range out {
-		fmt.Fprintf(&b, "%v — %v تومان — /approvetopup %v\n", p["id"], p["amount_toman"], p["id"])
-	}
-	return c.Send(strings.TrimSpace(b.String()))
+	return show(c, fmt.Sprintf("وضعیت reseller %d ثبت شد: %v", telegramID, out["approval_status"]), markup([]telebot.Btn{btn("بازگشت به درخواست‌ها", "resellers"), btn("مدیریت", "admin")}))
 }
-func (a *botApp) approveTopup(c telebot.Context) error {
-	return a.adminAction(c, "approvetopup", "/v1/wallet/topups/%d/approve")
+func (a *botApp) showPending(c telebot.Context, act actor, kind string) error {
+	path, label := "/v1/admin/payments", "پرداخت‌های منتظر"
+	action := "approve"
+	if kind == "pendingtopups" {
+		path, label, action = "/v1/admin/topups", "شارژهای منتظر", "approvetopup"
+	}
+	var items []map[string]any
+	if err := a.call(c, "GET", path, act.TelegramID, nil, &items); err != nil {
+		return sendFailure(c, err)
+	}
+	if len(items) == 0 {
+		return show(c, "درخواست معوقی وجود ندارد.", markup([]telebot.Btn{btn("مدیریت", "admin")}))
+	}
+	rows := make([][]telebot.Btn, 0, len(items)+1)
+	for _, item := range items {
+		id := fmt.Sprint(item["id"])
+		rows = append(rows, []telebot.Btn{btn(fmt.Sprintf("%s · %v تومان", id, item["amount_toman"]), action+"|"+id)})
+	}
+	rows = append(rows, []telebot.Btn{btn("مدیریت", "admin")})
+	return show(c, label, markup(rows...))
+}
+func (a *botApp) adminAction(c telebot.Context, act actor, path string) error {
+	var out map[string]any
+	if err := a.call(c, "POST", path, act.TelegramID, map[string]any{}, &out); err != nil {
+		return sendFailure(c, err)
+	}
+	return show(c, "عملیات ثبت شد: "+fmt.Sprint(out["status"]), markup([]telebot.Btn{btn("مدیریت", "admin")}))
 }
 
-func (a *botApp) adminAction(c telebot.Context, command, path string) error {
-	act, err := a.resolve(c)
-	if err != nil {
+func (a *botApp) showConfig(c telebot.Context, act actor) error {
+	var cfg adminConfig
+	if err := a.call(c, "GET", "/v1/admin/config", act.TelegramID, nil, &cfg); err != nil {
 		return sendFailure(c, err)
 	}
-	args := arguments(c)
-	if len(args) != 1 {
-		return c.Send("استفاده: /" + command + " <id>")
-	}
-	id, err := strconv.ParseInt(args[0], 10, 64)
-	if err != nil || id <= 0 {
-		return c.Send("شناسه نامعتبر است.")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	var out map[string]any
-	if err = a.api.Call(ctx, "POST", fmt.Sprintf(path, id), act.TelegramID, map[string]any{}, &out); err != nil {
-		return sendFailure(c, err)
-	}
-	return c.Send("عملیات ثبت شد: " + fmt.Sprint(out["status"]))
+	rows := [][]telebot.Btn{{btn("طرح‌ها و قیمت‌ها", "cfg|plans"), btn("پرداخت واریزی", "cfg|payment")}, {btn("قواعد تست و قابلیت‌ها", "cfg|settings"), btn("اتصال پنل", "cfg|panel")}, {btn("متن‌های ربات", "cfg|text")}, {btn("مدیریت", "admin")}}
+	return show(c, fmt.Sprintf("پیکربندی این deployment (%s)\nپنل: %s · رمز تنظیم شده: %t", cfg.Channel, cfg.Panel.BaseURL, cfg.Panel.TokenConfigured), markup(rows...))
 }
-func arguments(c telebot.Context) []string {
-	if c.Message() == nil {
-		return nil
+func (a *botApp) configSection(c telebot.Context, act actor, section string) error {
+	switch section {
+	case "plans":
+		return a.configPlans(c, act)
+	case "payment":
+		var cfg adminConfig
+		if err := a.call(c, "GET", "/v1/admin/config", act.TelegramID, nil, &cfg); err != nil {
+			return sendFailure(c, err)
+		}
+		return show(c, fmt.Sprintf("شماره کارت: %s\nصاحب کارت: %s\nراهنما: %s", cfg.Payment.CardNumber, cfg.Payment.CardOwner, cfg.Payment.Instructions), markup([]telebot.Btn{btn("تغییر شماره کارت", "cfgset|payment|card_number"), btn("تغییر صاحب کارت", "cfgset|payment|card_owner")}, []telebot.Btn{btn("تغییر راهنمای پرداخت", "cfgset|payment|instructions")}, []telebot.Btn{btn("بازگشت", "config")}))
+	case "settings":
+		return a.configSettings(c, act)
+	case "text":
+		return a.configTexts(c, act)
+	case "panel":
+		var cfg adminConfig
+		if err := a.call(c, "GET", "/v1/admin/config", act.TelegramID, nil, &cfg); err != nil {
+			return sendFailure(c, err)
+		}
+		return show(c, fmt.Sprintf("نشانی پنل: %s\nتوکن ذخیره شده: %t\nبرای تغییر، ابتدا نشانی را وارد کنید و سپس توکن را وارد کنید.", cfg.Panel.BaseURL, cfg.Panel.TokenConfigured), markup([]telebot.Btn{btn("تغییر اطلاعات پنل", "cfgset|panel|base_url")}, []telebot.Btn{btn("بازگشت", "config")}))
+	default:
+		return show(c, "بخش نامعتبر است.", markup([]telebot.Btn{btn("مدیریت", "admin")}))
 	}
-	fields := strings.Fields(c.Message().Text)
-	if len(fields) < 2 {
-		return nil
+}
+func (a *botApp) configPlans(c telebot.Context, act actor) error {
+	var cfg adminConfig
+	if err := a.call(c, "GET", "/v1/admin/config", act.TelegramID, nil, &cfg); err != nil {
+		return sendFailure(c, err)
 	}
-	return fields[1:]
+	rows := make([][]telebot.Btn, 0, len(cfg.Plans)+2)
+	for _, p := range cfg.Plans {
+		rows = append(rows, []telebot.Btn{btn(fmt.Sprintf("%s · %s · %t", p.Name, p.Kind, p.Enabled), fmt.Sprintf("planedit|%d", p.ID))})
+	}
+	rows = append(rows, []telebot.Btn{btn("ایجاد طرح", "cfgset|plan|new")}, []telebot.Btn{btn("بازگشت", "config")})
+	return show(c, "طرح را برای ویرایش قیمت‌ها و مشخصات انتخاب کنید.", markup(rows...))
+}
+func (a *botApp) planEditor(c telebot.Context, act actor, idText string) error {
+	id, e := strconv.ParseInt(idText, 10, 64)
+	if e != nil {
+		return show(c, "شناسه طرح نامعتبر است.")
+	}
+	var cfg adminConfig
+	if err := a.call(c, "GET", "/v1/admin/config", act.TelegramID, nil, &cfg); err != nil {
+		return sendFailure(c, err)
+	}
+	for _, p := range cfg.Plans {
+		if p.ID == id {
+			return show(c, fmt.Sprintf("طرح %s · نوع %s · فعال %t · قیمت پایه %d · هر GB %d · سهمیه روزانه %d", p.Name, p.Kind, p.Enabled, p.BasePrice, p.PriceGB, p.MaxPerDay), markup([]telebot.Btn{btn("نام", "planfield|"+idText+"|name"), btn("نوع paid/test", "planfield|"+idText+"|kind")}, []telebot.Btn{btn("فعال", "planfield|"+idText+"|enabled"), btn("محدودیت حجمی", "planfield|"+idText+"|is_limited")}, []telebot.Btn{btn("توضیحات", "planfield|"+idText+"|description"), btn("قیمت پایه", "planfield|"+idText+"|base_price_toman")}, []telebot.Btn{btn("قیمت هر GB", "planfield|"+idText+"|price_per_gb_toman"), btn("قیمت IP اضافه", "planfield|"+idText+"|price_per_extra_ip_toman")}, []telebot.Btn{btn("قیمت ماه اضافه", "planfield|"+idText+"|price_per_extra_month_toman"), btn("سهمیه روزانه", "planfield|"+idText+"|max_per_day")}, []telebot.Btn{btn("IP پایه", "planfield|"+idText+"|base_ip_limit"), btn("حداکثر IP", "planfield|"+idText+"|max_ip_limit")}, []telebot.Btn{btn("حداقل GB", "planfield|"+idText+"|min_data_gb"), btn("حداکثر bytes", "planfield|"+idText+"|max_data_bytes")}, []telebot.Btn{btn("مدت تست", "planfield|"+idText+"|expire_seconds"), btn("IP تست", "planfield|"+idText+"|test_ip_limit")}, []telebot.Btn{btn("Flow", "planfield|"+idText+"|flow"), btn("Inbound IDs", "planfield|"+idText+"|inbound_ids")}, []telebot.Btn{btn("توضیح مصرف", "planfield|"+idText+"|usage_description")}, []telebot.Btn{btn("بازگشت", "cfg|plans")}))
+		}
+	}
+	return show(c, "طرح پیدا نشد.", markup([]telebot.Btn{btn("بازگشت", "cfg|plans")}))
+}
+func (a *botApp) startPlanEdit(c telebot.Context, act actor, id, field string) error {
+	current := ""
+	var cfg adminConfig
+	if err := a.call(c, "GET", "/v1/admin/config", act.TelegramID, nil, &cfg); err == nil {
+		for _, p := range cfg.Plans {
+			if strconv.FormatInt(p.ID, 10) == id {
+				b, _ := json.Marshal(p)
+				values := map[string]json.RawMessage{}
+				_ = json.Unmarshal(b, &values)
+				current = string(values[field])
+				break
+			}
+		}
+	}
+	a.setFlow(act.TelegramID, conversation{Step: "planvalue", Vals: map[string]string{"id": id, "field": field}, Expires: time.Now().Add(20 * time.Minute)})
+	return show(c, fmt.Sprintf("مقدار فعلی %s: %s\nمقدار جدید را وارد کنید.", field, current), markup([]telebot.Btn{btn("لغو", "config")}))
+}
+func (a *botApp) configSettings(c telebot.Context, act actor) error {
+	var cfg adminConfig
+	if err := a.call(c, "GET", "/v1/admin/config", act.TelegramID, nil, &cfg); err != nil {
+		return sendFailure(c, err)
+	}
+	rows := [][]telebot.Btn{{btn(fmt.Sprintf("سهمیه روزانه نامؤید: %d", cfg.Settings.UnapprovedTrialDailyLimit), "cfgset|settings|unapproved_trial_daily_limit")}, {btn(resellerApprovalButtonLabel(cfg.Settings.ResellerApprovedRequired), "cfgset|settings|reseller_approved_required")}}
+	keys := []string{"purchases_enabled", "trials_enabled", "wallet_enabled", "topups_enabled", "direct_payments_enabled"}
+	for _, key := range keys {
+		rows = append(rows, []telebot.Btn{btn(fmt.Sprintf("%s: %t (تغییر)", key, featureEnabled(cfg.Settings.Features, key)), "feature|"+key)})
+	}
+	rows = append(rows, []telebot.Btn{btn("بازگشت", "config")})
+	return show(c, fmt.Sprintf("سهمیه تست روزانه: %d. تأیید و قابلیت‌ها در backend هم اعمال می‌شوند.", cfg.Settings.UnapprovedTrialDailyLimit), markup(rows...))
+}
+func resellerApprovalButtonLabel(required bool) string {
+	if required {
+		return "فقط reseller تأییدشده: بله"
+	}
+	return "فقط reseller تأییدشده: خیر"
+}
+func (a *botApp) configTexts(c telebot.Context, act actor) error {
+	var cfg adminConfig
+	if err := a.call(c, "GET", "/v1/admin/config", act.TelegramID, nil, &cfg); err != nil {
+		return sendFailure(c, err)
+	}
+	rows := make([][]telebot.Btn, 0, len(cfg.Settings.Text)+1)
+	for key, value := range cfg.Settings.Text {
+		rows = append(rows, []telebot.Btn{btn(key+": "+short(value, 24), "cfgset|text|"+key)})
+	}
+	rows = append(rows, []telebot.Btn{btn("افزودن متن", "cfgset|text|new")})
+	rows = append(rows, []telebot.Btn{btn("بازگشت", "config")})
+	return show(c, "متن مورد نظر را انتخاب کنید.", markup(rows...))
+}
+func (a *botApp) startConfigEdit(c telebot.Context, act actor, section, field string) error {
+	if section == "text" && field == "new" {
+		a.setFlow(act.TelegramID, conversation{Step: "cfgtextkey", Vals: map[string]string{"section": "text"}, Expires: time.Now().Add(20 * time.Minute)})
+		return show(c, "یک کلید کوتاه انگلیسی وارد کنید؛ نمونه: home_title", markup([]telebot.Btn{btn("لغو", "config")}))
+	}
+	prompt := "مقدار جدید را وارد کنید."
+	if section == "payment" {
+		prompt = "مقدار جدید را وارد کنید."
+	}
+	if section == "panel" && field == "base_url" {
+		prompt = "نشانی پایه پنل را وارد کنید؛ سپس ربات از شما توکن را می‌خواهد."
+	}
+	if section == "plan" {
+		fields := []string{"name", "kind", "enabled", "is_limited", "description", "base_price_toman", "price_per_extra_ip_toman", "price_per_gb_toman", "price_per_extra_month_toman", "base_ip_limit", "max_ip_limit", "min_data_gb", "max_data_bytes", "expire_seconds", "test_ip_limit", "max_per_day", "flow", "inbound_ids", "usage_description"}
+		st := conversation{Step: "plancreate", Vals: map[string]string{"fields": strings.Join(fields, ","), "index": "0"}, Expires: time.Now().Add(30 * time.Minute)}
+		return a.askPlanField(c, act.TelegramID, st)
+	}
+	a.setFlow(act.TelegramID, conversation{Step: "cfgvalue", Vals: map[string]string{"section": section, "field": field}, Expires: time.Now().Add(20 * time.Minute)})
+	return show(c, prompt, markup([]telebot.Btn{btn("لغو", "config")}))
+}
+
+func planPrompt(field string) string {
+	prompts := map[string]string{"name": "نام طرح", "kind": "نوع: paid یا test", "enabled": "فعال: true یا false", "is_limited": "طرح حجمی است؟ true یا false", "description": "توضیحات", "base_price_toman": "قیمت پایه (تومان)", "price_per_extra_ip_toman": "هزینه هر IP اضافه (تومان)", "price_per_gb_toman": "قیمت هر GB (تومان)", "price_per_extra_month_toman": "هزینه هر ماه اضافه (تومان)", "base_ip_limit": "تعداد IP پایه", "max_ip_limit": "حداکثر IP", "min_data_gb": "حداقل GB", "max_data_bytes": "حداکثر حجم بایت", "expire_seconds": "مدت اعتبار تست به ثانیه", "test_ip_limit": "محدودیت IP تست", "max_per_day": "سهمیه روزانه تست", "flow": "Flow پنل", "inbound_ids": "شناسه‌های inbound با کاما جدا شوند", "usage_description": "راهنمای مصرف"}
+	return prompts[field]
+}
+func (a *botApp) askPlanField(c telebot.Context, id int64, st conversation) error {
+	fields := strings.Split(st.Vals["fields"], ",")
+	i, _ := strconv.Atoi(st.Vals["index"])
+	if i >= len(fields) {
+		return show(c, "اطلاعات طرح کامل شد.")
+	}
+	return a.setFlowAndPrompt(c, id, st, planPrompt(fields[i])+" را وارد کنید.")
+}
+func (a *botApp) collectNewPlan(c telebot.Context, act actor, st conversation, value string) error {
+	fields := strings.Split(st.Vals["fields"], ",")
+	i, _ := strconv.Atoi(st.Vals["index"])
+	if st.Vals["values"] == "" {
+		st.Vals["values"] = "{}"
+	}
+	values := map[string]string{}
+	if err := json.Unmarshal([]byte(st.Vals["values"]), &values); err != nil {
+		values = map[string]string{}
+	}
+	field := fields[i]
+	if (field == "name" || field == "kind") && strings.TrimSpace(value) == "" {
+		return show(c, planPrompt(field)+" الزامی است.", markup([]telebot.Btn{btn("لغو", "config")}))
+	}
+	if err := setPlanField(&plan{}, field, value); err != nil {
+		return show(c, "مقدار نامعتبر برای "+field+": "+err.Error(), markup([]telebot.Btn{btn("لغو", "config")}))
+	}
+	values[field] = value
+	b, _ := json.Marshal(values)
+	st.Vals["values"] = string(b)
+	i++
+	st.Vals["index"] = strconv.Itoa(i)
+	if i < len(fields) {
+		st.Expires = time.Now().Add(30 * time.Minute)
+		a.setFlow(act.TelegramID, st)
+		return a.askPlanField(c, act.TelegramID, st)
+	}
+	p := plan{}
+	for name, raw := range values {
+		if err := setPlanField(&p, name, raw); err != nil {
+			st.Vals["index"] = strconv.Itoa(i - 1)
+			st.Vals["values"] = string(b)
+			a.setFlow(act.TelegramID, st)
+			return show(c, "مقدار نامعتبر برای "+name+": "+err.Error(), markup([]telebot.Btn{btn("لغو", "config")}))
+		}
+	}
+	if p.Name == "" || (p.Kind != "paid" && p.Kind != "test") {
+		return show(c, "نام الزامی و نوع باید paid یا test باشد.", markup([]telebot.Btn{btn("لغو", "config")}))
+	}
+	if err := a.call(c, "POST", "/v1/admin/config/plans", act.TelegramID, p, nil); err != nil {
+		return sendFailure(c, err)
+	}
+	a.clearFlow(act.TelegramID)
+	return a.configPlans(c, act)
+}
+func (a *botApp) saveConfigValue(c telebot.Context, act actor, st conversation, value string) error {
+	section, field := st.Vals["section"], st.Vals["field"]
+	payload := map[string]any{}
+	path := ""
+	switch section {
+	case "payment":
+		return a.patchPaymentInstruction(c, act, field, value)
+	case "settings":
+		path = "/v1/admin/config/settings"
+		if field == "unapproved_trial_daily_limit" {
+			v, e := strconv.Atoi(value)
+			if e != nil || v < 0 {
+				return show(c, "عدد نامعتبر است.")
+			}
+			payload[field] = v
+		} else if field == "reseller_approved_required" {
+			v, e := strconv.ParseBool(value)
+			if e != nil {
+				return show(c, "فقط true یا false وارد کنید.")
+			}
+			payload[field] = v
+		}
+	case "text":
+		path = "/v1/admin/config/settings"
+		var cfg adminConfig
+		if err := a.call(c, "GET", "/v1/admin/config", act.TelegramID, nil, &cfg); err != nil {
+			return sendFailure(c, err)
+		}
+		if cfg.Settings.Text == nil {
+			cfg.Settings.Text = map[string]string{}
+		}
+		cfg.Settings.Text[field] = value
+		payload["text"] = cfg.Settings.Text
+	case "panel":
+		if field == "base_url" {
+			st.Vals["base_url"] = value
+			st.Step = "paneltoken"
+			a.setFlow(act.TelegramID, st)
+			return show(c, "توکن پنل را وارد کنید. این مقدار فقط به backend ارسال و ذخیره می‌شود.", markup([]telebot.Btn{btn("لغو", "config")}))
+		}
+		return show(c, "بخش نامعتبر است.")
+	default:
+		return show(c, "بخش نامعتبر است.")
+	}
+	if err := a.call(c, "PATCH", path, act.TelegramID, payload, nil); err != nil {
+		return sendFailure(c, err)
+	}
+	a.clearFlow(act.TelegramID)
+	return show(c, "تنظیم ذخیره شد.", markup([]telebot.Btn{btn("بازگشت", "config")}))
+}
+
+func (a *botApp) patchPaymentInstruction(c telebot.Context, act actor, field, value string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := a.updatePaymentInstruction(ctx, act.TelegramID, field, value); err != nil {
+		return sendFailure(c, err)
+	}
+	a.clearFlow(act.TelegramID)
+	return show(c, "تنظیم پرداخت ذخیره شد و سایر مقادیر حفظ شدند.", markup([]telebot.Btn{btn("بازگشت", "config")}))
+}
+
+func (a *botApp) updatePaymentInstruction(ctx context.Context, actorID int64, field, value string) error {
+	var cfg adminConfig
+	if err := a.api.Call(ctx, "GET", "/v1/admin/config", actorID, nil, &cfg); err != nil {
+		return err
+	}
+	payload, err := buildPaymentInstructionPatch(cfg.Payment, field, value)
+	if err != nil {
+		return err
+	}
+	return a.api.Call(ctx, "PATCH", "/v1/admin/config/payment-instructions", actorID, payload, nil)
+}
+
+func buildPaymentInstructionPatch(current paymentInstructions, field, value string) (map[string]string, error) {
+	switch field {
+	case "card_number":
+		current.CardNumber = value
+	case "card_owner":
+		current.CardOwner = value
+	case "instructions":
+		current.Instructions = value
+	default:
+		return nil, fmt.Errorf("unsupported payment field")
+	}
+	return map[string]string{"card_number": current.CardNumber, "card_owner": current.CardOwner, "instructions": current.Instructions}, nil
+}
+
+func (a *botApp) toggleFeature(c telebot.Context, act actor, key string) error {
+	allowed := map[string]bool{"purchases_enabled": true, "trials_enabled": true, "wallet_enabled": true, "topups_enabled": true, "direct_payments_enabled": true}
+	if !allowed[key] {
+		return a.home(c, act, "قابلیت نامعتبر است.")
+	}
+	var cfg adminConfig
+	if err := a.call(c, "GET", "/v1/admin/config", act.TelegramID, nil, &cfg); err != nil {
+		return sendFailure(c, err)
+	}
+	if cfg.Settings.Features == nil {
+		cfg.Settings.Features = map[string]bool{}
+	}
+	cfg.Settings.Features[key] = !featureEnabled(cfg.Settings.Features, key)
+	if err := a.call(c, "PATCH", "/v1/admin/config/settings", act.TelegramID, map[string]any{"features": cfg.Settings.Features}, nil); err != nil {
+		return sendFailure(c, err)
+	}
+	return a.configSettings(c, act)
+}
+
+func featureEnabled(features map[string]bool, key string) bool {
+	value, exists := features[key]
+	return !exists || value
+}
+func validConfigKey(key string) bool {
+	if key == "" || len(key) > 40 {
+		return false
+	}
+	for _, r := range key {
+		if !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9') && r != '_' {
+			return false
+		}
+	}
+	return true
+}
+func (a *botApp) savePlanValue(c telebot.Context, act actor, st conversation, value string) error {
+	id, e := strconv.ParseInt(st.Vals["id"], 10, 64)
+	if e != nil {
+		return show(c, "شناسه طرح نامعتبر است.")
+	}
+	var cfg adminConfig
+	if err := a.call(c, "GET", "/v1/admin/config", act.TelegramID, nil, &cfg); err != nil {
+		return sendFailure(c, err)
+	}
+	var selected *plan
+	for i := range cfg.Plans {
+		if cfg.Plans[i].ID == id {
+			selected = &cfg.Plans[i]
+			break
+		}
+	}
+	if selected == nil {
+		return show(c, "طرح پیدا نشد.")
+	}
+	field := st.Vals["field"]
+	if err := setPlanField(selected, field, value); err != nil {
+		return show(c, "مقدار نامعتبر: "+err.Error())
+	}
+	payload, _ := json.Marshal(selected)
+	if err := a.call(c, "PUT", fmt.Sprintf("/v1/admin/config/plans/%d", id), act.TelegramID, json.RawMessage(payload), nil); err != nil {
+		return sendFailure(c, err)
+	}
+	a.clearFlow(act.TelegramID)
+	return a.planEditor(c, act, st.Vals["id"])
+}
+
+func setPlanField(p *plan, field, raw string) error {
+	parseInt := func(bits int) (int64, error) {
+		v, err := strconv.ParseInt(strings.TrimSpace(raw), 10, bits)
+		if err == nil && v < 0 {
+			err = fmt.Errorf("باید غیرمنفی باشد")
+		}
+		return v, err
+	}
+	parseBool := func() (bool, error) { return strconv.ParseBool(strings.TrimSpace(raw)) }
+	switch field {
+	case "name":
+		p.Name = raw
+	case "kind":
+		if raw != "paid" && raw != "test" {
+			return fmt.Errorf("نوع باید paid یا test باشد")
+		}
+		p.Kind = raw
+	case "enabled":
+		v, e := parseBool()
+		if e != nil {
+			return e
+		}
+		p.Enabled = v
+	case "is_limited":
+		v, e := parseBool()
+		if e != nil {
+			return e
+		}
+		p.IsLimited = v
+	case "description":
+		p.Description = raw
+	case "base_price_toman":
+		v, e := parseInt(64)
+		if e != nil {
+			return e
+		}
+		p.BasePrice = v
+	case "price_per_extra_ip_toman":
+		v, e := parseInt(64)
+		if e != nil {
+			return e
+		}
+		p.PriceExtraIP = v
+	case "price_per_gb_toman":
+		v, e := parseInt(64)
+		if e != nil {
+			return e
+		}
+		p.PriceGB = v
+	case "price_per_extra_month_toman":
+		v, e := parseInt(64)
+		if e != nil {
+			return e
+		}
+		p.PriceExtraMonth = v
+	case "base_ip_limit":
+		v, e := parseInt(32)
+		if e != nil {
+			return e
+		}
+		p.BaseIP = int(v)
+	case "max_ip_limit":
+		v, e := parseInt(32)
+		if e != nil {
+			return e
+		}
+		p.MaxIP = int(v)
+	case "min_data_gb":
+		v, e := parseInt(32)
+		if e != nil {
+			return e
+		}
+		p.MinGB = int(v)
+	case "max_data_bytes":
+		v, e := parseInt(64)
+		if e != nil {
+			return e
+		}
+		p.MaxBytes = v
+	case "expire_seconds":
+		v, e := parseInt(64)
+		if e != nil {
+			return e
+		}
+		p.ExpireSeconds = v
+	case "test_ip_limit":
+		v, e := parseInt(32)
+		if e != nil {
+			return e
+		}
+		p.TestIPLimit = int(v)
+	case "max_per_day":
+		v, e := parseInt(32)
+		if e != nil {
+			return e
+		}
+		p.MaxPerDay = int(v)
+	case "flow":
+		p.Flow = raw
+	case "inbound_ids":
+		p.InboundIDs = []int{}
+		for _, part := range strings.Split(raw, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			v, e := strconv.Atoi(part)
+			if e != nil || v <= 0 {
+				return fmt.Errorf("شناسه inbound نامعتبر است")
+			}
+			p.InboundIDs = append(p.InboundIDs, v)
+		}
+	case "usage_description":
+		p.UsageDescription = raw
+	default:
+		return fmt.Errorf("فیلد پشتیبانی نمی‌شود")
+	}
+	return nil
+}
+
+func (a *botApp) call(c telebot.Context, method, path string, actorID int64, in, out any) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return a.api.Call(ctx, method, path, actorID, in, out)
+}
+func (a *botApp) operationKey(c telebot.Context, op string) string {
+	var msgID int64
+	if c.Callback() != nil && c.Callback().Message != nil {
+		msgID = int64(c.Callback().Message.ID)
+	} else if c.Message() != nil {
+		msgID = int64(c.Message().ID)
+	}
+	chatID := int64(0)
+	if c.Chat() != nil {
+		chatID = c.Chat().ID
+	}
+	return stableKey(c.Sender().ID, chatID, msgID, op)
+}
+func (a *botApp) setFlow(id int64, st conversation) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.flows[id] = st
+}
+func (a *botApp) clearFlow(id int64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.flows, id)
+	delete(a.receipts, id)
 }
 func stableKey(senderID, chatID, messageID int64, operation string) string {
 	sum := sha256.Sum256([]byte(fmt.Sprintf("%d:%d:%d:%s", senderID, chatID, messageID, operation)))
 	return hex.EncodeToString(sum[:])
 }
+func short(s string, n int) string {
+	r := []rune(s)
+	if len(r) > n {
+		return string(r[:n]) + "…"
+	}
+	return s
+}
 func sendFailure(c telebot.Context, err error) error {
-	return c.Send("درخواست انجام نشد: " + err.Error())
+	return show(c, "درخواست انجام نشد: "+err.Error(), markup([]telebot.Btn{btn("بازگشت به خانه", "home")}))
 }

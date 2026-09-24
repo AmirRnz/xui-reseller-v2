@@ -1,21 +1,18 @@
 # Reseller Telegram adapter v2
 
-This repository is a presentation adapter. It talks only to `xui-backend`; it does not connect to PostgreSQL or 3x-ui. Its backend credential is scoped to the reseller deployment. The backend resolves actors and enforces reseller approval, account ownership, plan access, daily trial quota, and payment approval.
+This repository is a presentation adapter. It talks only to `xui-backend`; it does not connect to PostgreSQL or 3x-ui. Its backend credential is scoped to the reseller deployment. The backend resolves actors and enforces reseller approval, account ownership, plan access, daily trial quota, feature switches, and payment approval.
 
 ## Configure and run
 
-Copy `config.example.env` to a private `.env` and replace the values. PowerShell does not load `.env` automatically, so export the three values shown here into the process environment before running:
+Copy `config.example.env` to a private `.env` and set `TELEGRAM_BOT_TOKEN`, `BACKEND_URL`, and `BACKEND_TOKEN`. Run with those values in the process environment:
 
 ```powershell
-$env:TELEGRAM_BOT_TOKEN = '...'
-$env:BACKEND_URL = 'http://127.0.0.1:8088'
-$env:BACKEND_TOKEN = '...'
 go run ./cmd/bot
 ```
 
-Use `/plans`, `/plans test`, `/trial <plan_id>` for one test at a time, `/buy <plan_id> <months> <ip_limit> <data_gb> [name]`, `/pay ...`, `/wallet`, `/ledger`, `/topup <amount_toman>`, `/receipt <intent_id>`, `/topupreceipt <topup_id>`, `/services`, and `/cancel <subscription_id>`. `data_gb` is `0` for an unlimited plan. Test quota resets at 00:00 UTC; approved resellers use the plan's daily cap and unapproved resellers use the deployment default. Bulk tests remain disabled. Duplicate Telegram updates use stable message-scoped idempotency keys.
+The user interface is an inline-button menu. `/start` only opens the menu. At startup, the bot clears its Telegram slash-command list. Customers can browse paid and test plans, submit a single-user daily reseller trial, buy from wallet or by direct payment, view wallet and ledger, request top-ups and submit receipt photos, view subscriptions, and request cancellation from the buttons. Menu visibility, labels, and the home title read the deployment's backend feature and text settings. Batch reseller trials remain disabled. Payment and trial decisions remain backend-authoritative.
 
-Admin commands `/pending`, `/approve <intent_id>`, `/pendingtopups`, and `/approvetopup <topup_id>` are backend-authorized. The bot does not decide admin roles.
+Telegram user ID `96937669` sees the admin menu in this reseller deployment. The menu supports reseller application approval or rejection, pending payment and top-up approvals, plan creation and field-by-field plan editing, payment instructions, reseller trial quota and approval settings, feature switches, user-facing bot text, and deployment-scoped panel configuration. The backend must provision this ID as an admin for the reseller deployment and authorizes every admin API request. Panel tokens are submitted directly to the backend and the bot deletes the Telegram message containing the token after handling it.
 
 ```powershell
 go vet ./...
