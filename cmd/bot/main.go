@@ -76,9 +76,13 @@ type activeReceipt struct {
 	Amount    int64  `json:"amount_toman"`
 	CreatedAt string `json:"created_at"`
 }
-type activeReceiptResponse struct {
-	PaymentIntent *activeReceipt `json:"payment_intent"`
-	Topup         *activeReceipt `json:"topup"`
+type activeReceiptPage struct {
+	Items      []activeReceipt
+	NextCursor *int64
+}
+type activeReceiptSet struct {
+	Payments activeReceiptPage
+	Topups   activeReceiptPage
 }
 type adminReviewItem struct {
 	ID             int64  `json:"id"`
@@ -466,6 +470,16 @@ func (a *botApp) callback(c telebot.Context) error {
 		return a.homeFor(c, "صفحه اصلی")
 	case "resume":
 		return a.showResumeMenu(c, act)
+	case "resume-list":
+		if len(data) < 4 {
+			return a.home(c, act, "پارامتر فهرست فاکتورها نامعتبر است.")
+		}
+		beforeID, beforeErr := strconv.ParseInt(data[2], 10, 64)
+		offset, offsetErr := strconv.Atoi(data[3])
+		if beforeErr != nil || offsetErr != nil || beforeID < 0 || offset < 0 {
+			return a.home(c, act, "پارامتر فهرست فاکتورها نامعتبر است.")
+		}
+		return a.showResumeList(c, act, data[1], beforeID, offset)
 	case "resume-receipt":
 		if len(data) < 3 {
 			return a.home(c, act, "شناسه فاکتور نامعتبر است.")
@@ -1161,11 +1175,14 @@ func (a *botApp) photo(c telebot.Context) error {
 	st, ok := a.receipts[c.Sender().ID]
 	a.mu.Unlock()
 	if !ok {
-		active, activeErr := a.activeReceiptDetails(c, act.TelegramID)
+		active, complete, activeErr := a.awaitingPhotoReceipts(c, act.TelegramID)
 		if activeErr != nil {
 			return a.sendFailure(c, activeErr)
 		}
-		candidates := receiptCandidatesForPhoto(active)
+		candidates := receiptCandidatesForPhoto(active, complete)
+		if !complete {
+			return a.show(c, "درخواست‌های رسید زیاد هستند؛ برای جلوگیری از اتصال عکس به فاکتور اشتباه، ابتدا از فهرست ادامه پرداخت یا شارژ فاکتور را انتخاب کنید.", markup([]telebot.Btn{btn("ادامه پرداخت یا شارژ", "resume")}, []telebot.Btn{btn("خانه", "home")}))
+		}
 		switch len(candidates) {
 		case 0:
 			return a.show(c, "فاکتور منتظر رسید پیدا نشد. اگر فاکتور فعال دارید از گزینه ادامه پرداخت یا شارژ استفاده کنید.", markup([]telebot.Btn{btn("ادامه پرداخت یا شارژ", "resume")}, []telebot.Btn{btn("خانه", "home")}))

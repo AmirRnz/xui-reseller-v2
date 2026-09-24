@@ -1,9 +1,13 @@
 package main
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"example.com/xui-resell-bot-v2/internal/backend"
 )
 
 func TestPurchaseFlowRequiresCurrentStepAndUnexpiredState(t *testing.T) {
@@ -52,14 +56,14 @@ func TestTopupRetryKeepsTheOriginalAmountAndIdempotencyKey(t *testing.T) {
 }
 
 func TestActiveReceiptResponsesRecoverPendingPaymentAndTopup(t *testing.T) {
-	active := activeReceiptStates(activeReceiptResponse{
-		PaymentIntent: &activeReceipt{ID: 11, Status: "awaiting_receipt", Amount: 90000},
-		Topup:         &activeReceipt{ID: 12, Status: "receipt_submitted", Amount: 50000},
+	active := activeReceiptStates(activeReceiptSet{
+		Payments: activeReceiptPage{Items: []activeReceipt{{ID: 11, Status: "awaiting_receipt", Amount: 90000}}},
+		Topups:   activeReceiptPage{Items: []activeReceipt{{ID: 12, Status: "receipt_submitted", Amount: 50000}}},
 	})
 	if len(active) != 2 || active[0] != (receiptState{Kind: "payment", ID: 11}) || active[1] != (receiptState{Kind: "topup", ID: 12}) {
 		t.Fatalf("recovered receipts = %#v", active)
 	}
-	if got := activeReceiptStates(activeReceiptResponse{}); len(got) != 0 {
+	if got := activeReceiptStates(activeReceiptSet{}); len(got) != 0 {
 		t.Fatalf("empty active receipt response = %#v", got)
 	}
 }
@@ -69,17 +73,97 @@ func TestPhotoRecoveryAfterRestartUsesBackendActiveRequests(t *testing.T) {
 	if len(app.receipts) != 0 {
 		t.Fatal("simulated restarted process should have no in-memory receipt state")
 	}
-	active := activeReceiptResponse{
-		PaymentIntent: &activeReceipt{ID: 11, Status: "awaiting_receipt"},
-		Topup:         &activeReceipt{ID: 12, Status: "receipt_submitted"},
+	active := activeReceiptSet{
+		Payments: activeReceiptPage{Items: []activeReceipt{
+			{ID: 11, Status: "awaiting_receipt"},
+			{ID: 10, Status: "receipt_submitted"},
+		}},
+		Topups: activeReceiptPage{Items: []activeReceipt{
+			{ID: 12, Status: "receipt_submitted"},
+		}},
 	}
-	got := receiptCandidatesForPhoto(active)
+	got := receiptCandidatesForPhoto(active, true)
 	if len(got) != 1 || got[0] != (receiptState{Kind: "payment", ID: 11}) {
 		t.Fatalf("recoverable receipts = %#v; want only the awaiting payment intent", got)
 	}
-	active.Topup.Status = "awaiting_receipt"
-	if got = receiptCandidatesForPhoto(active); len(got) != 2 {
+	active.Topups.Items[0].Status = "awaiting_receipt"
+	if got = receiptCandidatesForPhoto(active, true); len(got) != 2 {
 		t.Fatalf("multiple awaiting receipts = %#v; want both to require explicit selection", got)
+	}
+	if got = receiptCandidatesForPhoto(active, false); len(got) != 0 {
+		t.Fatalf("incomplete scan must not auto-associate a photo, got %#v", got)
+	}
+}
+
+func TestRestartPhotoRecoveryFindsOlderAwaitingRequestBehindNewerSubmitted(t *testing.T) {
+	app := &botApp{receipts: map[int64]receiptState{}}
+	if len(app.receipts) != 0 {
+		t.Fatal("simulated restarted process should have no in-memory receipt state")
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/payment-intents/active":
+			switch r.URL.Query().Get("before_id") {
+			case "":
+				_, _ = w.Write([]byte(`{"payment_intents":[{"id":19,"status":"receipt_submitted"}],"payment_intent":{"id":19,"status":"receipt_submitted"},"next_cursor":19}`))
+			case "19":
+				_, _ = w.Write([]byte(`{"payment_intents":[{"id":18,"status":"awaiting_receipt"}],"payment_intent":{"id":18,"status":"awaiting_receipt"},"next_cursor":null}`))
+			default:
+				t.Errorf("unexpected payment cursor: %s", r.URL.String())
+				http.NotFound(w, r)
+			}
+		case "/v1/wallet/topups/active":
+			_, _ = w.Write([]byte(`{"topups":[],"topup":null,"next_cursor":null}`))
+		default:
+			t.Errorf("unexpected request: %s", r.URL.String())
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	app.api = &backend.Client{BaseURL: server.URL, Token: "test", HTTP: server.Client()}
+	active, complete, err := app.awaitingPhotoReceipts(nil, 123)
+	if err != nil || !complete {
+		t.Fatalf("active receipt recovery complete=%t err=%v", complete, err)
+	}
+	got := receiptCandidatesForPhoto(active, complete)
+	if len(got) != 1 || got[0] != (receiptState{Kind: "payment", ID: 18}) {
+		t.Fatalf("recovered receipts = %#v; expected older awaiting request #18", got)
+	}
+}
+
+func TestActiveReceiptPaginationUsesExclusiveCursorAndBoundsMenuPages(t *testing.T) {
+	var gotCursor string
+	app := &botApp{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotCursor = r.URL.Query().Get("before_id")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"topups":[{"id":8,"status":"awaiting_receipt"}],"next_cursor":null}`))
+	}))
+	defer server.Close()
+	app.api = &backend.Client{BaseURL: server.URL, Token: "test", HTTP: server.Client()}
+	page, err := app.activeReceiptPage(nil, 123, "topup", 9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotCursor != "9" || len(page.Items) != 1 || page.Items[0].ID != 8 {
+		t.Fatalf("cursor=%q page=%#v", gotCursor, page)
+	}
+	if resumePageSize != 8 {
+		t.Fatalf("resume list page size=%d; want bounded menu of 8", resumePageSize)
+	}
+}
+
+func TestActiveReceiptPageSupportsLegacySingularResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"payment_intent":{"id":4,"status":"awaiting_receipt"}}`))
+	}))
+	defer server.Close()
+	app := &botApp{api: &backend.Client{BaseURL: server.URL, Token: "test", HTTP: server.Client()}}
+	page, err := app.activeReceiptPage(nil, 123, "payment", 0)
+	if err != nil || len(page.Items) != 1 || page.Items[0].ID != 4 {
+		t.Fatalf("legacy response page=%#v err=%v", page, err)
 	}
 }
 

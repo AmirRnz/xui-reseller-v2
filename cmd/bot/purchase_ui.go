@@ -19,50 +19,99 @@ func adminCallbackAction(action string) bool {
 	}
 }
 
+const resumePageSize = 8
+const receiptRecoveryMaxPages = 10
+
 func (a *botApp) activeReceipts(c telebot.Context, actorID int64) ([]receiptState, error) {
-	result, err := a.activeReceiptDetails(c, actorID)
+	active, err := a.activeReceiptDetails(c, actorID)
 	if err != nil {
 		return nil, err
 	}
-	return activeReceiptStates(result), nil
+	return activeReceiptStates(active), nil
 }
 
-func activeReceiptStates(result activeReceiptResponse) []receiptState {
-	active := make([]receiptState, 0, 2)
-	if result.PaymentIntent != nil && result.PaymentIntent.ID > 0 {
-		active = append(active, receiptState{Kind: "payment", ID: result.PaymentIntent.ID})
+func activeReceiptStates(active activeReceiptSet) []receiptState {
+	states := make([]receiptState, 0, len(active.Payments.Items)+len(active.Topups.Items))
+	for _, item := range active.Payments.Items {
+		if item.ID > 0 {
+			states = append(states, receiptState{Kind: "payment", ID: item.ID})
+		}
 	}
-	if result.Topup != nil && result.Topup.ID > 0 {
-		active = append(active, receiptState{Kind: "topup", ID: result.Topup.ID})
+	for _, item := range active.Topups.Items {
+		if item.ID > 0 {
+			states = append(states, receiptState{Kind: "topup", ID: item.ID})
+		}
 	}
-	return active
+	return states
 }
 
-func receiptCandidatesForPhoto(active activeReceiptResponse) []receiptState {
+func receiptCandidatesForPhoto(active activeReceiptSet, complete bool) []receiptState {
 	candidates := make([]receiptState, 0, 2)
-	if active.PaymentIntent != nil && active.PaymentIntent.ID > 0 && active.PaymentIntent.Status == "awaiting_receipt" {
-		candidates = append(candidates, receiptState{Kind: "payment", ID: active.PaymentIntent.ID})
+	for _, item := range active.Payments.Items {
+		if item.ID > 0 && item.Status == "awaiting_receipt" {
+			candidates = append(candidates, receiptState{Kind: "payment", ID: item.ID})
+		}
 	}
-	if active.Topup != nil && active.Topup.ID > 0 && active.Topup.Status == "awaiting_receipt" {
-		candidates = append(candidates, receiptState{Kind: "topup", ID: active.Topup.ID})
+	for _, item := range active.Topups.Items {
+		if item.ID > 0 && item.Status == "awaiting_receipt" {
+			candidates = append(candidates, receiptState{Kind: "topup", ID: item.ID})
+		}
+	}
+	if !complete {
+		return nil
 	}
 	return candidates
 }
 
-func (a *botApp) activeReceiptDetails(c telebot.Context, actorID int64) (activeReceiptResponse, error) {
-	var payment struct {
-		PaymentIntent *activeReceipt `json:"payment_intent"`
+func (a *botApp) activeReceiptPage(c telebot.Context, actorID int64, kind string, beforeID int64) (activeReceiptPage, error) {
+	var path string
+	var response struct {
+		PaymentIntents []activeReceipt `json:"payment_intents"`
+		Topups         []activeReceipt `json:"topups"`
+		PaymentIntent  *activeReceipt  `json:"payment_intent"`
+		Topup          *activeReceipt  `json:"topup"`
+		NextCursor     *int64          `json:"next_cursor"`
 	}
-	var topup struct {
-		Topup *activeReceipt `json:"topup"`
+	switch kind {
+	case "payment":
+		path = "/v1/payment-intents/active"
+	case "topup":
+		path = "/v1/wallet/topups/active"
+	default:
+		return activeReceiptPage{}, fmt.Errorf("نوع فاکتور نامعتبر است")
 	}
-	if err := a.call(c, "GET", "/v1/payment-intents/active", actorID, nil, &payment); err != nil {
-		return activeReceiptResponse{}, err
+	if beforeID < 0 {
+		return activeReceiptPage{}, fmt.Errorf("invalid active receipt cursor")
 	}
-	if err := a.call(c, "GET", "/v1/wallet/topups/active", actorID, nil, &topup); err != nil {
-		return activeReceiptResponse{}, err
+	if beforeID > 0 {
+		path += "?before_id=" + strconv.FormatInt(beforeID, 10)
 	}
-	return activeReceiptResponse{PaymentIntent: payment.PaymentIntent, Topup: topup.Topup}, nil
+	if err := a.call(c, "GET", path, actorID, nil, &response); err != nil {
+		return activeReceiptPage{}, err
+	}
+	items := response.PaymentIntents
+	newest := response.PaymentIntent
+	if kind == "topup" {
+		items = response.Topups
+		newest = response.Topup
+	}
+	// Retain compatibility with an older backend while arrays are introduced.
+	if len(items) == 0 && newest != nil {
+		items = []activeReceipt{*newest}
+	}
+	return activeReceiptPage{Items: items, NextCursor: response.NextCursor}, nil
+}
+
+func (a *botApp) activeReceiptDetails(c telebot.Context, actorID int64) (activeReceiptSet, error) {
+	payments, err := a.activeReceiptPage(c, actorID, "payment", 0)
+	if err != nil {
+		return activeReceiptSet{}, err
+	}
+	topups, err := a.activeReceiptPage(c, actorID, "topup", 0)
+	if err != nil {
+		return activeReceiptSet{}, err
+	}
+	return activeReceiptSet{Payments: payments, Topups: topups}, nil
 }
 
 func (a *botApp) showResumeMenu(c telebot.Context, act actor) error {
@@ -72,57 +121,151 @@ func (a *botApp) showResumeMenu(c telebot.Context, act actor) error {
 	}
 	rows := make([][]telebot.Btn, 0, 3)
 	var text strings.Builder
-	text.WriteString("فاکتورهای فعال شما:\n")
-	found := false
-	needsReceipt := false
+	text.WriteString("درخواست‌های پرداخت و شارژ شما:\n")
 	for _, item := range []struct {
 		kind  string
 		label string
-		value *activeReceipt
-	}{{"payment", "پرداخت سرویس", active.PaymentIntent}, {"topup", "شارژ کیف پول", active.Topup}} {
-		if item.value == nil || item.value.ID <= 0 {
+		page  activeReceiptPage
+	}{{"payment", "پرداخت سرویس", active.Payments}, {"topup", "شارژ کیف پول", active.Topups}} {
+		if len(item.page.Items) == 0 {
 			continue
 		}
-		found = true
-		fmt.Fprintf(&text, "\n%s #%d · %s تومان · وضعیت: %s", item.label, item.value.ID, formatToman(item.value.Amount), item.value.Status)
-		if item.value.Status == "awaiting_receipt" {
-			needsReceipt = true
-			rows = append(rows, []telebot.Btn{btn("📷 ارسال رسید · "+item.label, fmt.Sprintf("resume-receipt|%s|%d", item.kind, item.value.ID))})
-		} else {
-			text.WriteString(" (رسید ارسال شده و در انتظار بررسی است)")
+		latest := item.page.Items[0]
+		fmt.Fprintf(&text, "\n%s: %d مورد در انتظار · آخرین #%d، %s تومان، %s", item.label, len(item.page.Items), latest.ID, formatToman(latest.Amount), receiptStatusLabel(latest.Status))
+		if item.page.NextCursor != nil {
+			text.WriteString(" · موارد قدیمی‌تر هم وجود دارد")
 		}
+		rows = append(rows, []telebot.Btn{btn("مشاهده «"+item.label+"»", fmt.Sprintf("resume-list|%s|0|0", item.kind))})
 	}
-	if !found {
+	if len(rows) == 0 {
 		return a.show(c, "فاکتور فعالی برای ادامه وجود ندارد.", markup([]telebot.Btn{btn("خانه", "home")}))
 	}
 	rows = append(rows, []telebot.Btn{btn("خانه", "home")})
-	if needsReceipt {
-		text.WriteString("\n\nبرای ادامه، رسید همان فاکتور را ارسال کنید.")
-	}
 	return a.show(c, strings.TrimSpace(text.String()), markup(rows...))
 }
 
-func (a *botApp) resumeReceipt(c telebot.Context, act actor, kind string, id int64) error {
-	active, err := a.activeReceiptDetails(c, act.TelegramID)
+func (a *botApp) showResumeList(c telebot.Context, act actor, kind string, beforeID int64, offset int) error {
+	if (kind != "payment" && kind != "topup") || beforeID < 0 || offset < 0 || offset >= 100 {
+		return a.show(c, "پارامتر فهرست فاکتورها نامعتبر است.", markup([]telebot.Btn{btn("ادامه فاکتور", "resume")}, []telebot.Btn{btn("خانه", "home")}))
+	}
+	page, err := a.activeReceiptPage(c, act.TelegramID, kind, beforeID)
 	if err != nil {
 		return a.sendFailure(c, err)
 	}
-	var selected *activeReceipt
-	switch kind {
-	case "payment":
-		selected = active.PaymentIntent
-	case "topup":
-		selected = active.Topup
+	if offset > len(page.Items) {
+		return a.show(c, "این صفحه دیگر در دسترس نیست.", markup([]telebot.Btn{btn("ادامه فاکتور", "resume")}))
+	}
+	label := "پرداخت سرویس"
+	if kind == "topup" {
+		label = "شارژ کیف پول"
+	}
+	if len(page.Items) == 0 {
+		return a.show(c, "درخواستی برای نمایش وجود ندارد.", markup([]telebot.Btn{btn("بازگشت", "resume")}))
+	}
+	end := offset + resumePageSize
+	if end > len(page.Items) {
+		end = len(page.Items)
+	}
+	rows := make([][]telebot.Btn, 0, resumePageSize+3)
+	var text strings.Builder
+	fmt.Fprintf(&text, "%sها (موارد %d تا %d از این صفحه):", label, offset+1, end)
+	for _, item := range page.Items[offset:end] {
+		fmt.Fprintf(&text, "\n\n#%d · %s تومان · %s", item.ID, formatToman(item.Amount), receiptStatusLabel(item.Status))
+		if item.Status == "awaiting_receipt" {
+			rows = append(rows, []telebot.Btn{btn(fmt.Sprintf("📷 رسید #%d · %s", item.ID, formatToman(item.Amount)), fmt.Sprintf("resume-receipt|%s|%d", kind, item.ID))})
+		}
+	}
+	if end < len(page.Items) {
+		rows = append(rows, []telebot.Btn{btn("موارد بعدی", fmt.Sprintf("resume-list|%s|%d|%d", kind, beforeID, end))})
+	} else if page.NextCursor != nil && *page.NextCursor > 0 {
+		rows = append(rows, []telebot.Btn{btn("درخواست‌های قدیمی‌تر", fmt.Sprintf("resume-list|%s|%d|0", kind, *page.NextCursor))})
+	}
+	if beforeID > 0 || offset > 0 {
+		rows = append(rows, []telebot.Btn{btn("جدیدترین درخواست‌ها", fmt.Sprintf("resume-list|%s|0|0", kind))})
+	}
+	rows = append(rows, []telebot.Btn{btn("بازگشت به فهرست", "resume")})
+	return a.show(c, text.String(), markup(rows...))
+}
+
+func receiptStatusLabel(status string) string {
+	switch status {
+	case "awaiting_receipt":
+		return "منتظر ارسال رسید"
+	case "receipt_submitted":
+		return "رسید ارسال شده، در انتظار بررسی"
+	case "approved":
+		return "تأیید شده"
+	case "rejected":
+		return "رد شده"
 	default:
+		return status
+	}
+}
+
+func (a *botApp) findActiveReceipt(c telebot.Context, actorID int64, kind string, id int64) (*activeReceipt, error) {
+	for pageNo, cursor := 0, int64(0); pageNo < receiptRecoveryMaxPages; pageNo++ {
+		page, err := a.activeReceiptPage(c, actorID, kind, cursor)
+		if err != nil {
+			return nil, err
+		}
+		for i := range page.Items {
+			if page.Items[i].ID == id {
+				return &page.Items[i], nil
+			}
+		}
+		if page.NextCursor == nil || *page.NextCursor <= 0 {
+			return nil, nil
+		}
+		cursor = *page.NextCursor
+	}
+	return nil, nil
+}
+
+func (a *botApp) resumeReceipt(c telebot.Context, act actor, kind string, id int64) error {
+	if kind != "payment" && kind != "topup" {
 		return a.home(c, act, "نوع فاکتور نامعتبر است.")
 	}
-	if selected == nil || selected.ID != id || selected.Status != "awaiting_receipt" {
+	selected, err := a.findActiveReceipt(c, act.TelegramID, kind, id)
+	if err != nil {
+		return a.sendFailure(c, err)
+	}
+	if selected == nil || selected.Status != "awaiting_receipt" {
 		return a.show(c, "این فاکتور دیگر منتظر رسید نیست. وضعیت را از منوی ادامه فاکتور بررسی کنید.", markup([]telebot.Btn{btn("ادامه فاکتور", "resume")}, []telebot.Btn{btn("خانه", "home")}))
 	}
 	a.mu.Lock()
 	a.receipts[act.TelegramID] = receiptState{Kind: kind, ID: id}
 	a.mu.Unlock()
 	return a.show(c, fmt.Sprintf("رسید فاکتور %d را به‌صورت عکس ارسال کنید. مبلغ: %s تومان.", id, formatToman(selected.Amount)), markup([]telebot.Btn{btn("لغو", "home")}))
+}
+
+func (a *botApp) awaitingPhotoReceipts(c telebot.Context, actorID int64) (activeReceiptSet, bool, error) {
+	all := activeReceiptSet{}
+	complete := true
+	for _, kind := range []string{"payment", "topup"} {
+		var cursor int64
+		for pageNo := 0; pageNo < receiptRecoveryMaxPages; pageNo++ {
+			page, err := a.activeReceiptPage(c, actorID, kind, cursor)
+			if err != nil {
+				return activeReceiptSet{}, false, err
+			}
+			target := &all.Payments
+			if kind == "topup" {
+				target = &all.Topups
+			}
+			target.Items = append(target.Items, page.Items...)
+			if page.NextCursor == nil || *page.NextCursor <= 0 {
+				target.NextCursor = nil
+				break
+			}
+			if pageNo == receiptRecoveryMaxPages-1 {
+				target.NextCursor = page.NextCursor
+				complete = false
+				break
+			}
+			cursor = *page.NextCursor
+		}
+	}
+	return all, complete, nil
 }
 
 func (a *botApp) currentPurchaseFlow(id int64, step string) (conversation, bool) {
