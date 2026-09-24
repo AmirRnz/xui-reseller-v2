@@ -111,6 +111,17 @@ func TestResellerApprovalSettingIsDisplayedAsCurrentValue(t *testing.T) {
 	}
 }
 
+func TestAdminConfigDecodesBackendStringIdentifiers(t *testing.T) {
+	var cfg adminConfig
+	data := `{"deployment_id":"reseller-turk1","panel":{"id":"panel-17","base_url":"https://panel.example","token_configured":true}}`
+	if err := json.Unmarshal([]byte(data), &cfg); err != nil {
+		t.Fatalf("decode admin config: %v", err)
+	}
+	if cfg.DeploymentID != "reseller-turk1" || cfg.Panel.ID != "panel-17" {
+		t.Fatalf("unexpected identifiers: deployment=%q panel=%q", cfg.DeploymentID, cfg.Panel.ID)
+	}
+}
+
 func TestAdminGateRequiresConfiguredIDAndBackendRole(t *testing.T) {
 	if !isAdmin(actor{TelegramID: adminTelegramID, Role: "admin"}) {
 		t.Fatal("configured backend admin should pass the UI gate")
@@ -180,6 +191,55 @@ func TestSubscriptionLinkPagesRespectTelegramTextLimitWithoutSkipping(t *testing
 	}
 	if seen != len(links) {
 		t.Fatalf("shown links = %d, want %d", seen, len(links))
+	}
+}
+
+func TestSubscriptionLinkPaginationUsesHistoryAndSplitsLongLinks(t *testing.T) {
+	long := "vless://" + strings.Repeat("L", 7000)
+	s := subscription{DisplayName: "Service", Links: []string{long, "https://short.example/a", "vless://another"}}
+	parts := subscriptionLinkParts(s.Links)
+	if len(parts) < 4 {
+		t.Fatalf("long links were not split into text-safe parts: %d", len(parts))
+	}
+	text, next, previous := renderSubscriptionDetails(s, 0)
+	if next != 1 || previous != -1 {
+		t.Fatalf("first cursor next=%d previous=%d, want 1/-1", next, previous)
+	}
+	if utf8.RuneCountInString(text) > 4096 || !strings.Contains(text, parts[0].text) {
+		t.Fatal("first page exceeds Telegram limit or omits first link part")
+	}
+	text, next, previous = renderSubscriptionDetails(s, 1)
+	if previous != 0 {
+		t.Fatalf("uneven page previous cursor=%d, want actual prior page start 0", previous)
+	}
+	if utf8.RuneCountInString(text) > 4096 || !strings.Contains(text, parts[1].text) {
+		t.Fatal("second page exceeds Telegram limit or omits next long-link part")
+	}
+	start := 0
+	seen := make([]bool, len(parts))
+	for {
+		page, nextCursor, _ := renderSubscriptionDetails(s, start)
+		if utf8.RuneCountInString(page) > 4096 {
+			t.Fatalf("page exceeds Telegram limit: %d", utf8.RuneCountInString(page))
+		}
+		if nextCursor < 0 {
+			nextCursor = len(parts)
+		}
+		if nextCursor <= start && start < len(parts) {
+			t.Fatalf("pagination stuck at cursor %d", start)
+		}
+		for i := start; i < nextCursor; i++ {
+			seen[i] = strings.Contains(page, parts[i].text)
+		}
+		if nextCursor == len(parts) {
+			break
+		}
+		start = nextCursor
+	}
+	for i, ok := range seen {
+		if !ok {
+			t.Fatalf("link part %d was skipped", i)
+		}
 	}
 }
 

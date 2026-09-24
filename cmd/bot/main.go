@@ -102,12 +102,12 @@ type paymentInstructions struct {
 	Instructions string `json:"instructions"`
 }
 type panelConfig struct {
-	ID              int64  `json:"id"`
+	ID              string `json:"id"`
 	BaseURL         string `json:"base_url"`
 	TokenConfigured bool   `json:"token_configured"`
 }
 type adminConfig struct {
-	DeploymentID int64               `json:"deployment_id"`
+	DeploymentID string              `json:"deployment_id"`
 	Channel      string              `json:"channel"`
 	Plans        []plan              `json:"plans"`
 	Payment      paymentInstructions `json:"payment_instructions"`
@@ -782,6 +782,57 @@ func (a *botApp) subscriptionDetails(c telebot.Context, act actor, id int64, pag
 	return a.show(c, "این سرویس در حساب شما پیدا نشد.", markup([]telebot.Btn{btn("سرویس‌های من", "services"), btn("خانه", "home")}))
 }
 
+type subscriptionLinkPart struct {
+	link, part, total int
+	text              string
+}
+
+func subscriptionLinkParts(links []string) []subscriptionLinkPart {
+	parts := []subscriptionLinkPart{}
+	for linkIndex, link := range links {
+		runes := []rune(link)
+		count := (len(runes) + maxSubscriptionLinkChunk - 1) / maxSubscriptionLinkChunk
+		if count == 0 {
+			continue
+		}
+		for partIndex, offset := 0, 0; offset < len(runes); partIndex, offset = partIndex+1, offset+maxSubscriptionLinkChunk {
+			end := offset + maxSubscriptionLinkChunk
+			if end > len(runes) {
+				end = len(runes)
+			}
+			parts = append(parts, subscriptionLinkPart{link: linkIndex + 1, part: partIndex + 1, total: count, text: string(runes[offset:end])})
+		}
+	}
+	return parts
+}
+
+func (p subscriptionLinkPart) display() string {
+	if p.total > 1 {
+		return fmt.Sprintf("\n🔗 لینک %d · بخش %d/%d (بخش‌ها را به‌ترتیب بدون فاصله بچسبانید):\n%s", p.link, p.part, p.total, p.text)
+	}
+	return fmt.Sprintf("\n🔗 لینک %d:\n%s", p.link, p.text)
+}
+
+func subscriptionPageEnd(base string, parts []subscriptionLinkPart, start int) int {
+	if start < 0 {
+		start = 0
+	}
+	if start > len(parts) {
+		return len(parts)
+	}
+	end := start
+	text := base
+	for end < len(parts) && end-start < maxSubscriptionLinksPerPage {
+		line := parts[end].display()
+		if utf8.RuneCountInString(text+line) > maxSubscriptionPageRunes {
+			break
+		}
+		text += line
+		end++
+	}
+	return end
+}
+
 func renderSubscriptionDetails(s subscription, start int) (string, int, int) {
 	if start < 0 {
 		start = 0
@@ -795,41 +846,45 @@ func renderSubscriptionDetails(s subscription, start int) (string, int, int) {
 		traffic = fmt.Sprintf("%.2f GB", float64(s.TrafficLimitBytes)/(1000*1000*1000))
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s\nوضعیت: %s · نوع: %s\nایمیل/شناسه: %s\nIP مجاز: %d · حجم: %s\nانقضا: %s", s.DisplayName, s.Status, s.Kind, s.Email, s.IPLimit, traffic, expiry)
-	const maxRunes = 3600
-	if start > len(s.Links) {
-		start = len(s.Links)
-	}
-	end := start
-	for end < len(s.Links) && end-start < maxSubscriptionLinksPerPage {
-		line := "\n🔗 " + s.Links[end]
-		if utf8.RuneCountInString(b.String()+line) > maxRunes {
-			break
-		}
-		b.WriteString(line)
-		end++
-	}
-	if len(s.Links) == 0 {
+	fmt.Fprintf(&b, "%s\nوضعیت: %s · نوع: %s\nایمیل/شناسه: %s\nIP مجاز: %d · حجم: %s\nانقضا: %s", short(s.DisplayName, 80), short(s.Status, 40), short(s.Kind, 40), short(s.Email, 100), s.IPLimit, traffic, expiry)
+	base := b.String()
+	parts := subscriptionLinkParts(s.Links)
+	if len(parts) == 0 {
 		b.WriteString("\nلینک اشتراک هنوز در دسترس نیست.")
+		return b.String(), -1, -1
 	}
-	if end < len(s.Links) {
-		b.WriteString(fmt.Sprintf("\n\nلینک‌ها %d تا %d از %d", start+1, end, len(s.Links)))
+	if start > len(parts) {
+		start = len(parts)
+	}
+	end := subscriptionPageEnd(base, parts, start)
+	for index := start; index < end; index++ {
+		b.WriteString(parts[index].display())
 	}
 	previous := -1
 	if start > 0 {
-		previous = start - maxSubscriptionLinksPerPage
-		if previous < 0 {
-			previous = 0
+		cursor := 0
+		for cursor < start {
+			next := subscriptionPageEnd(base, parts, cursor)
+			if next <= cursor {
+				break
+			}
+			if next >= start {
+				previous = cursor
+				break
+			}
+			cursor = next
 		}
 	}
 	next := -1
-	if end < len(s.Links) {
+	if end < len(parts) {
 		next = end
 	}
 	return b.String(), next, previous
 }
 
 const maxSubscriptionLinksPerPage = 5
+const maxSubscriptionLinkChunk = 2500
+const maxSubscriptionPageRunes = 3600
 
 func (a *botApp) adminHome(c telebot.Context, act actor) error {
 	return a.show(c, "مدیریت فقط برای مدیر پیکربندی‌شده در این deployment در دسترس است.", markup([]telebot.Btn{btn("درخواست‌های reseller", "resellers")}, []telebot.Btn{btn("پرداخت‌های در انتظار", "pending"), btn("شارژهای در انتظار", "pendingtopups")}, []telebot.Btn{btn("تنظیمات ربات و طرح‌ها", "config")}, []telebot.Btn{btn("خانه", "home")}))
