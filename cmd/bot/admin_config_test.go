@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -131,6 +132,65 @@ func TestAdminGateRequiresConfiguredIDAndBackendRole(t *testing.T) {
 	}
 	if isAdmin(actor{TelegramID: adminTelegramID + 1, Role: "admin"}) {
 		t.Fatal("other Telegram IDs must not pass")
+	}
+}
+
+func TestPanelConfigRequiresPrivateChat(t *testing.T) {
+	for name, chat := range map[string]*telebot.Chat{
+		"private":    {Type: telebot.ChatPrivate},
+		"group":      {Type: telebot.ChatGroup},
+		"supergroup": {Type: telebot.ChatSuperGroup},
+		"missing":    nil,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := isPrivateChat(chat); got != (name == "private") {
+				t.Fatalf("isPrivateChat = %t", got)
+			}
+		})
+	}
+}
+
+func TestPanelTokenFromGroupIsDeletedButNeverSubmitted(t *testing.T) {
+	deleted, submitted := false, false
+	err := submitPanelToken(&telebot.Chat{Type: telebot.ChatGroup}, func() error {
+		deleted = true
+		return nil
+	}, func() error {
+		submitted = true
+		return nil
+	})
+	if !deleted || !errors.Is(err, errPanelPrivateChat) || submitted {
+		t.Fatalf("group token handling: deleted=%t submitted=%t err=%v", deleted, submitted, err)
+	}
+}
+
+func TestPrivatePanelTokenIsDeletedBeforeSubmission(t *testing.T) {
+	var events []string
+	err := submitPanelToken(&telebot.Chat{Type: telebot.ChatPrivate}, func() error {
+		events = append(events, "delete")
+		return nil
+	}, func() error {
+		events = append(events, "submit")
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(events, ","), "delete,submit"; got != want {
+		t.Fatalf("operation order = %q, want %q", got, want)
+	}
+}
+
+func TestPanelTokenDeleteFailureStopsSubmission(t *testing.T) {
+	submitted := false
+	err := submitPanelToken(&telebot.Chat{Type: telebot.ChatPrivate}, func() error {
+		return fmt.Errorf("telegram delete failed")
+	}, func() error {
+		submitted = true
+		return nil
+	})
+	if !errors.Is(err, errPanelTokenDelete) || submitted {
+		t.Fatalf("delete failure: submitted=%t err=%v", submitted, err)
 	}
 }
 

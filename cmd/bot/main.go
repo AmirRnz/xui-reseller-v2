@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -118,6 +119,11 @@ type runtimeConfig struct {
 	Features map[string]bool   `json:"features"`
 	Text     map[string]string `json:"text"`
 }
+
+var (
+	errPanelPrivateChat = errors.New("panel configuration requires a private chat")
+	errPanelTokenDelete = errors.New("panel token message could not be deleted")
+)
 
 func main() {
 	if err := run(); err != nil {
@@ -449,10 +455,16 @@ func (a *botApp) callback(c telebot.Context) error {
 		if !isAdmin(act) || len(data) < 2 {
 			return a.homeFor(c, "این بخش در دسترس نیست.")
 		}
+		if data[1] == "panel" && !isPrivateChat(c.Chat()) {
+			return a.show(c, "تنظیم پنل فقط در گفت‌وگوی خصوصی در دسترس است.", markup([]telebot.Btn{btn("بازگشت", "config")}))
+		}
 		return a.configSection(c, act, data[1])
 	case "cfgset":
 		if !isAdmin(act) || len(data) < 3 {
 			return a.homeFor(c, "این بخش در دسترس نیست.")
+		}
+		if data[1] == "panel" && !isPrivateChat(c.Chat()) {
+			return a.show(c, "تنظیم پنل فقط در گفت‌وگوی خصوصی در دسترس است.", markup([]telebot.Btn{btn("بازگشت", "config")}))
 		}
 		return a.startConfigEdit(c, act, data[1], data[2])
 	case "planedit":
@@ -558,6 +570,27 @@ func (a *botApp) text(c telebot.Context) error {
 		a.clearFlow(act.TelegramID)
 		return a.home(c, act, "از منو گزینه‌ای را انتخاب کنید.")
 	}
+	if st.Step == "paneltoken" {
+		err := submitPanelToken(c.Chat(), c.Delete, func() error {
+			payload := map[string]string{"base_url": st.Vals["base_url"], "token": raw}
+			return a.call(c, "PUT", "/v1/admin/config/panel", act.TelegramID, payload, nil)
+		})
+		a.clearFlow(act.TelegramID)
+		switch {
+		case errors.Is(err, errPanelPrivateChat):
+			return c.Send("اطلاعات اتصال پنل فقط در گفت‌وگوی خصوصی پذیرفته می‌شود. تنظیم را از منوی خصوصی دوباره آغاز کنید.")
+		case errors.Is(err, errPanelTokenDelete):
+			return c.Send("پیام توکن حذف نشد و هیچ تغییری ذخیره نشد. لطفاً پیام را خودتان حذف کنید و دوباره در گفت‌وگوی خصوصی تلاش کنید.")
+		case err != nil:
+			return a.show(c, "ذخیره تنظیمات پنل انجام نشد. مقدار توکن را بررسی کنید و دوباره تلاش کنید.", markup([]telebot.Btn{btn("بازگشت", "config")}))
+		default:
+			return a.show(c, "تنظیمات پنل ذخیره شد.", markup([]telebot.Btn{btn("بازگشت", "config")}))
+		}
+	}
+	if st.Step == "cfgvalue" && st.Vals["section"] == "panel" && !isPrivateChat(c.Chat()) {
+		a.clearFlow(act.TelegramID)
+		return c.Send("نشانی پنل فقط در گفت‌وگوی خصوصی پذیرفته می‌شود. تنظیم را از منوی خصوصی دوباره آغاز کنید.")
+	}
 	if raw == "لغو" {
 		a.clearFlow(act.TelegramID)
 		return a.home(c, act, "عملیات لغو شد.")
@@ -619,18 +652,6 @@ func (a *botApp) text(c telebot.Context) error {
 		st.Expires = time.Now().Add(20 * time.Minute)
 		a.setFlow(act.TelegramID, st)
 		return a.show(c, "متن جدید را وارد کنید.", markup([]telebot.Btn{btn("لغو", "config")}))
-	case "paneltoken":
-		if !isAdmin(act) {
-			return a.home(c, act, "این بخش در دسترس نیست.")
-		}
-		defer c.Delete()
-		payload := map[string]string{"base_url": st.Vals["base_url"], "token": raw}
-		if err := a.call(c, "PUT", "/v1/admin/config/panel", act.TelegramID, payload, nil); err != nil {
-			a.clearFlow(act.TelegramID)
-			return a.sendFailure(c, err)
-		}
-		a.clearFlow(act.TelegramID)
-		return a.show(c, "تنظیمات پنل ذخیره شد.", markup([]telebot.Btn{btn("بازگشت", "config")}))
 	case "planvalue":
 		if !isAdmin(act) {
 			return a.home(c, act, "این بخش در دسترس نیست.")
@@ -645,6 +666,22 @@ func (a *botApp) text(c telebot.Context) error {
 		a.clearFlow(act.TelegramID)
 		return a.home(c, act, "ورودی منقضی شد. از منو دوباره شروع کنید.")
 	}
+}
+
+func isPrivateChat(chat *telebot.Chat) bool {
+	return chat != nil && chat.Type == telebot.ChatPrivate
+}
+
+// submitPanelToken removes the message containing the credential before the
+// credential is sent to the backend. A failed delete stops the update.
+func submitPanelToken(chat *telebot.Chat, deleteMessage func() error, submit func() error) error {
+	if deleteMessage == nil || deleteMessage() != nil {
+		return errPanelTokenDelete
+	}
+	if !isPrivateChat(chat) {
+		return errPanelPrivateChat
+	}
+	return submit()
 }
 func (a *botApp) setFlowAndPrompt(c telebot.Context, id int64, st conversation, prompt string) error {
 	st.Expires = time.Now().Add(20 * time.Minute)
