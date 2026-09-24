@@ -3,14 +3,17 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"example.com/xui-resell-bot-v2/internal/backend"
+	"gopkg.in/telebot.v3"
 )
 
 func TestPaymentInstructionPatchPreservesOtherFields(t *testing.T) {
@@ -117,5 +120,77 @@ func TestAdminGateRequiresConfiguredIDAndBackendRole(t *testing.T) {
 	}
 	if isAdmin(actor{TelegramID: adminTelegramID + 1, Role: "admin"}) {
 		t.Fatal("other Telegram IDs must not pass")
+	}
+}
+
+func TestAttemptKeyIsStableForRetriesAndFreshForNewUpdate(t *testing.T) {
+	firstDelivery := attemptKey(41, 9, 5001, "trial-7")
+	if retry := attemptKey(41, 9, 5001, "trial-7"); retry != firstDelivery {
+		t.Fatalf("retry key = %q, want %q", retry, firstDelivery)
+	}
+	if nextDay := attemptKey(41, 9, 6001, "trial-7"); nextDay == firstDelivery {
+		t.Fatal("a later button press must get a fresh attempt key")
+	}
+}
+
+func TestCallbackDataRejectsStaleMenuVersions(t *testing.T) {
+	app := &botApp{menus: map[int64]string{41: "current-token"}}
+	parts, valid := app.callbackData(41, "trial|7|vcurrent-token")
+	if !valid || len(parts) != 2 || parts[0] != "trial" || parts[1] != "7" {
+		t.Fatalf("current callback = %#v, valid=%t", parts, valid)
+	}
+	if _, valid := app.callbackData(41, "trial|7|vprevious-token"); valid {
+		t.Fatal("callback from a previous screen must be rejected")
+	}
+	if _, valid := app.callbackData(41, "trial|7"); valid {
+		t.Fatal("callback without a screen token must be rejected")
+	}
+	keyboard := &telebot.ReplyMarkup{InlineKeyboard: [][]telebot.InlineButton{{{Data: "trial|7"}}}}
+	bindMenuToken(keyboard, "current-token")
+	if got := keyboard.InlineKeyboard[0][0].Data; got != "trial|7|vcurrent-token" {
+		t.Fatalf("bound callback = %q", got)
+	}
+}
+
+func TestSubscriptionLinkPagesRespectTelegramTextLimitWithoutSkipping(t *testing.T) {
+	links := []string{}
+	for i := 0; i < 8; i++ {
+		links = append(links, fmt.Sprintf("vless://%d-%s", i, strings.Repeat("x", 1100)))
+	}
+	s := subscription{DisplayName: "VPN", Links: links}
+	start := 0
+	seen := 0
+	for {
+		text, next, _ := renderSubscriptionDetails(s, start)
+		if utf8.RuneCountInString(text) > 4096 {
+			t.Fatalf("page exceeds Telegram text limit: %d", utf8.RuneCountInString(text))
+		}
+		for i := start; i < len(links) && i < start+maxSubscriptionLinksPerPage; i++ {
+			if strings.Contains(text, links[i]) {
+				seen++
+			}
+		}
+		if next < 0 {
+			break
+		}
+		if next <= start {
+			t.Fatalf("pagination did not advance from %d: next %d", start, next)
+		}
+		start = next
+	}
+	if seen != len(links) {
+		t.Fatalf("shown links = %d, want %d", seen, len(links))
+	}
+}
+
+func TestSubscriptionDetailsRenderOwnerLinksWithPagination(t *testing.T) {
+	s := subscription{ID: 9, DisplayName: "My VPN", Email: "owner@example.test", Status: "active", Kind: "paid", IPLimit: 2, TrafficLimitBytes: 2_000_000_000, ExpiryTimeMS: 1_800_000_000_000, Links: []string{"vless://one", "vless://two", "vless://three", "vless://four", "vless://five", "vless://six"}}
+	first, next, previous := renderSubscriptionDetails(s, 0)
+	if next != 5 || previous != -1 || !strings.Contains(first, "owner@example.test") || !strings.Contains(first, "vless://one") || !strings.Contains(first, "vless://five") || strings.Contains(first, "vless://six") {
+		t.Fatalf("first page or metadata is wrong: next=%d previous=%d, text=%q", next, previous, first)
+	}
+	second, next, previous := renderSubscriptionDetails(s, 5)
+	if next != -1 || previous != 0 || !strings.Contains(second, "vless://six") {
+		t.Fatalf("second page is wrong: next=%d previous=%d, text=%q", next, previous, second)
 	}
 }
