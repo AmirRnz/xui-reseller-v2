@@ -773,7 +773,25 @@ func (a *botApp) callback(c telebot.Context) error {
 		if !isAdmin(act) {
 			return a.homeFor(c, "این بخش در دسترس نیست.")
 		}
-		return a.showPending(c, act, data[0])
+		return a.showPending(c, act, data[0], 0)
+	case "pendingpage":
+		if !canOpenAdmin(c.Chat(), act) || len(data) < 3 {
+			return a.homeFor(c, "این بخش در دسترس نیست.")
+		}
+		page, err := parseAdminPage(data[2])
+		if err != nil || (data[1] != "pending" && data[1] != "pendingtopups") {
+			return a.home(c, act, "صفحه درخواست نامعتبر است.")
+		}
+		return a.showPending(c, act, data[1], page)
+	case "resellerpage":
+		if !canOpenAdmin(c.Chat(), act) || len(data) < 2 {
+			return a.homeFor(c, "این بخش در دسترس نیست.")
+		}
+		page, err := parseAdminPage(data[1])
+		if err != nil {
+			return a.home(c, act, "صفحه درخواست نامعتبر است.")
+		}
+		return a.pendingResellersPage(c, act, page)
 	case "resellers":
 		if !isAdmin(act) {
 			return a.homeFor(c, "این بخش در دسترس نیست.")
@@ -1393,6 +1411,9 @@ func (a *botApp) adminHome(c telebot.Context, act actor) error {
 	return a.show(c, "مدیریت فقط برای مدیر پیکربندی‌شده در این deployment در دسترس است.", markup([]telebot.Btn{btn("درخواست‌های reseller", "resellers")}, []telebot.Btn{btn("پرداخت‌های در انتظار", "pending"), btn("شارژهای در انتظار", "pendingtopups")}, []telebot.Btn{btn("کارهای عملیاتی", "work-items"), btn("استردادهای در انتظار", "refunds")}, []telebot.Btn{btn("تنظیمات ربات و طرح‌ها", "config")}, []telebot.Btn{btn("خانه", "home")}))
 }
 func (a *botApp) pendingResellers(c telebot.Context, act actor) error {
+	return a.pendingResellersPage(c, act, 0)
+}
+func (a *botApp) pendingResellersPage(c telebot.Context, act actor, page int) error {
 	var items []map[string]any
 	if err := a.call(c, "GET", "/v1/admin/resellers/pending", act.TelegramID, nil, &items); err != nil {
 		return a.sendFailure(c, err)
@@ -1400,11 +1421,18 @@ func (a *botApp) pendingResellers(c telebot.Context, act actor) error {
 	if len(items) == 0 {
 		return a.show(c, "درخواست تأیید reseller در انتظار نیست.", markup([]telebot.Btn{btn("مدیریت", "admin")}))
 	}
-	rows := make([][]telebot.Btn, 0, len(items)+1)
-	for _, item := range items {
+	start, end, ok := adminPageBounds(len(items), page)
+	if !ok {
+		return a.show(c, "این صفحه از فهرست درخواست‌ها وجود ندارد.", markup([]telebot.Btn{btn("بازگشت", "resellers")}))
+	}
+	rows := make([][]telebot.Btn, 0, end-start+2)
+	for _, item := range items[start:end] {
 		id := fmt.Sprint(item["telegram_id"])
 		label := fmt.Sprintf("%s · %v", id, item["approval_status"])
 		rows = append(rows, []telebot.Btn{btn(label, "resapprove|"+id), btn("رد", "resreject|"+id)})
+	}
+	if nav := adminPageNavigation(page, len(items), "resellerpage"); len(nav) > 0 {
+		rows = append(rows, nav)
 	}
 	rows = append(rows, []telebot.Btn{btn("مدیریت", "admin")})
 	return a.show(c, "درخواست‌های reseller در همین deployment:", markup(rows...))
@@ -1421,7 +1449,7 @@ func (a *botApp) reviewReseller(c telebot.Context, act actor, telegramID int64, 
 	}
 	return a.show(c, fmt.Sprintf("وضعیت reseller %d ثبت شد: %v", telegramID, out["approval_status"]), markup([]telebot.Btn{btn("بازگشت به درخواست‌ها", "resellers"), btn("مدیریت", "admin")}))
 }
-func (a *botApp) showPending(c telebot.Context, act actor, kind string) error {
+func (a *botApp) showPending(c telebot.Context, act actor, kind string, page int) error {
 	path, label := "/v1/admin/payments", "پرداخت‌های منتظر"
 	action := "review-payment"
 	if kind == "pendingtopups" {
@@ -1434,10 +1462,17 @@ func (a *botApp) showPending(c telebot.Context, act actor, kind string) error {
 	if len(items) == 0 {
 		return a.show(c, "درخواست معوقی وجود ندارد.", markup([]telebot.Btn{btn("مدیریت", "admin")}))
 	}
-	rows := make([][]telebot.Btn, 0, len(items)+1)
-	for _, item := range items {
+	start, end, ok := adminPageBounds(len(items), page)
+	if !ok {
+		return a.show(c, "این صفحه از فهرست درخواست‌ها وجود ندارد.", markup([]telebot.Btn{btn("بازگشت", kind)}))
+	}
+	rows := make([][]telebot.Btn, 0, end-start+2)
+	for _, item := range items[start:end] {
 		id := fmt.Sprint(item["id"])
 		rows = append(rows, []telebot.Btn{btn(fmt.Sprintf("بررسی رسید #%s · %v تومان", id, item["amount_toman"]), action+"|"+id)})
+	}
+	if nav := adminPageNavigation(page, len(items), "pendingpage|"+kind); len(nav) > 0 {
+		rows = append(rows, nav)
 	}
 	rows = append(rows, []telebot.Btn{btn("مدیریت", "admin")})
 	return a.show(c, label, markup(rows...))
