@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -224,13 +226,17 @@ func TestAttemptKeyIsStableForRetriesAndFreshForNewUpdate(t *testing.T) {
 }
 
 func TestCallbackDataRejectsStaleMenuVersions(t *testing.T) {
-	app := &botApp{menus: map[int64]string{41: "current-token"}}
 	for _, raw := range []string{"trial|7|vcurrent-token", "\fgo|trial|7|vcurrent-token"} {
+		app := &botApp{menus: map[int64]string{41: "current-token"}}
 		parts, valid := app.callbackData(41, raw)
 		if !valid || len(parts) != 2 || parts[0] != "trial" || parts[1] != "7" {
 			t.Fatalf("current callback %q = %#v, valid=%t", raw, parts, valid)
 		}
+		if _, valid := app.callbackData(41, raw); valid {
+			t.Fatalf("callback token was reusable after accepting %q", raw)
+		}
 	}
+	app := &botApp{menus: map[int64]string{41: "current-token"}}
 	if _, valid := app.callbackData(41, "trial|7|vprevious-token"); valid {
 		t.Fatal("callback from a previous screen must be rejected")
 	}
@@ -244,6 +250,44 @@ func TestCallbackDataRejectsStaleMenuVersions(t *testing.T) {
 	bindMenuToken(keyboard, "current-token")
 	if got := keyboard.InlineKeyboard[0][0].Data; got != "trial|7|vcurrent-token" {
 		t.Fatalf("bound callback = %q", got)
+	}
+}
+
+func TestConcurrentDuplicateTrialAndQuoteCallbacksConsumeMenuOnce(t *testing.T) {
+	for _, action := range []string{"trial|7", "purchase-default-name"} {
+		t.Run(action, func(t *testing.T) {
+			app := &botApp{menus: map[int64]string{41: "current-token"}}
+			bot, err := telebot.NewBot(telebot.Settings{Offline: true, Synchronous: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var accepted atomic.Int32
+			registerCallbackHandlers(bot, func(c telebot.Context) error {
+				if _, ok := app.callbackData(c.Sender().ID, c.Data()); ok {
+					accepted.Add(1)
+				}
+				return nil
+			})
+			var wg sync.WaitGroup
+			for i := 0; i < 32; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					bot.ProcessUpdate(telebot.Update{Callback: &telebot.Callback{
+						ID: action, Sender: &telebot.User{ID: 41}, Data: "\fgo|" + action + "|vcurrent-token",
+					}})
+				}()
+			}
+			wg.Wait()
+			if got := accepted.Load(); got != 1 {
+				t.Fatalf("accepted callback dispatches = %d, want one", got)
+			}
+			app.mu.Lock()
+			defer app.mu.Unlock()
+			if _, exists := app.menus[41]; exists {
+				t.Fatal("consumed menu token should be invalid until the handler renders the next menu")
+			}
+		})
 	}
 }
 

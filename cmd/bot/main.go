@@ -379,10 +379,12 @@ func (a *botApp) callbackData(userID int64, raw string) ([]string, bool) {
 	token := strings.TrimPrefix(parts[len(parts)-1], "v")
 	a.mu.Lock()
 	current := a.menus[userID]
-	a.mu.Unlock()
 	if token == "" || current == "" || token != current {
+		a.mu.Unlock()
 		return nil, false
 	}
+	delete(a.menus, userID)
+	a.mu.Unlock()
 	return parts[:len(parts)-1], true
 }
 func (a *botApp) home(c telebot.Context, act actor, message string) error {
@@ -411,15 +413,21 @@ func textOr(values map[string]string, key, fallback string) string {
 	return fallback
 }
 func (a *botApp) callback(c telebot.Context) error {
-	if err := c.Respond(); err != nil {
-		log.Printf("callback acknowledgement failed: %v", err)
-	}
 	if c.Sender() == nil {
+		if err := c.Respond(); err != nil {
+			log.Printf("callback acknowledgement failed: %v", err)
+		}
 		return nil
 	}
 	data, current := a.callbackData(c.Sender().ID, c.Data())
 	if !current {
-		return a.homeFor(c, "این دکمه قدیمی شده است. منوی تازه را باز کنید.")
+		if err := c.Respond(&telebot.CallbackResponse{Text: "این دکمه قدیمی شده است؛ از آخرین منوی ارسال‌شده استفاده کنید."}); err != nil {
+			log.Printf("stale callback acknowledgement failed: %v", err)
+		}
+		return nil
+	}
+	if err := c.Respond(); err != nil {
+		log.Printf("callback acknowledgement failed: %v", err)
 	}
 	act, err := a.resolve(c)
 	if err != nil {
