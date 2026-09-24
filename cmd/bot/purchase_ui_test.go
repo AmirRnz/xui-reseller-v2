@@ -22,6 +22,25 @@ func TestPurchaseFlowRequiresCurrentStepAndUnexpiredState(t *testing.T) {
 	}
 }
 
+func TestCustomIPInputCoversEveryConfiguredValuePastInlinePreview(t *testing.T) {
+	p := plan{BaseIP: 2, MaxIP: 14}
+	preview := purchaseIPPreview(p.BaseIP, p.MaxIP)
+	if len(preview) != 8 || preview[0] != 2 || preview[len(preview)-1] != 9 {
+		t.Fatalf("IP preview = %v, want first eight limits 2 through 9", preview)
+	}
+	if !needsCustomPurchaseIP(p.BaseIP, p.MaxIP) {
+		t.Fatal("plan with limits beyond inline preview must expose custom IP input")
+	}
+	for value := p.BaseIP; value <= p.MaxIP; value++ {
+		if !validPurchaseIPLimit(value, p) {
+			t.Errorf("configured IP limit %d became unreachable", value)
+		}
+	}
+	if validPurchaseIPLimit(p.BaseIP-1, p) || validPurchaseIPLimit(p.MaxIP+1, p) {
+		t.Fatal("custom IP input must reject values outside backend plan bounds")
+	}
+}
+
 func TestTopupRetryKeepsTheOriginalAmountAndIdempotencyKey(t *testing.T) {
 	app := &botApp{flows: map[int64]conversation{42: {
 		Step: "topup-submit", Vals: map[string]string{"amount_toman": "50000", "operation_key": "stable-key"}, Expires: time.Now().Add(time.Minute),
@@ -69,6 +88,26 @@ func TestPaymentDestinationMustBeCompleteBeforeDirectInvoice(t *testing.T) {
 		if validPaymentDestination(instructions) {
 			t.Errorf("incomplete payment destination accepted: %#v", instructions)
 		}
+	}
+}
+
+func TestAmbiguousPurchaseRetryKeepsSelectedPaymentMethod(t *testing.T) {
+	features := runtimeConfig{Features: map[string]bool{"wallet_enabled": true, "direct_payments_enabled": true}}
+	for _, method := range []string{"wallet", "direct"} {
+		buttons := purchaseMethodButtons(features, method)
+		if len(buttons) != 1 || !strings.Contains(buttons[0].Data, "confirm-purchase|"+method) {
+			t.Errorf("retry buttons for %q = %#v; want only same-method retry", method, buttons)
+		}
+		other := "wallet"
+		if method == "wallet" {
+			other = "direct"
+		}
+		if !purchaseRetryMethodAllowed(method, method) || purchaseRetryMethodAllowed(other, method) {
+			t.Errorf("retry guard accepted method switch after %q outcome", method)
+		}
+	}
+	if len(purchaseMethodButtons(features, "")) != 2 {
+		t.Fatal("fresh quote should allow both enabled methods")
 	}
 }
 

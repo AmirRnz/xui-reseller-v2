@@ -73,24 +73,51 @@ func (a *botApp) showPurchaseIP(c telebot.Context, act actor, st conversation) e
 	}
 	st.Step = "ip"
 	a.setFlow(act.TelegramID, st)
-	rows := make([][]telebot.Btn, 0, 10)
-	max := p.MaxIP
-	if max < p.BaseIP {
-		max = p.BaseIP
-	}
-	for ip := p.BaseIP; ip <= max && len(rows) < 8; ip++ {
+	rows := make([][]telebot.Btn, 0, 12)
+	choices := purchaseIPPreview(p.BaseIP, p.MaxIP)
+	for _, ip := range choices {
 		label := fmt.Sprintf("%d IP هم‌زمان", ip)
 		if ip == 0 {
 			label = "IP هم‌زمان نامحدود"
 		}
 		rows = append(rows, []telebot.Btn{btn(label, fmt.Sprintf("ip|%d", ip))})
 	}
+	if needsCustomPurchaseIP(p.BaseIP, p.MaxIP) {
+		rows = append(rows, []telebot.Btn{btn("✏️ تعداد دلخواه IP", "ip-custom")})
+	}
 	back := "back-duration"
 	if p.IsLimited {
 		back = "back-data"
 	}
 	rows = append(rows, []telebot.Btn{btn("بازگشت", back), btn("خانه", "home")})
-	return a.show(c, fmt.Sprintf("%s\nمدت: %s ماه\n\nمحدودیت IP هم‌زمان را انتخاب کنید:", p.Name, st.Vals["months"]), markup(rows...))
+	return a.show(c, fmt.Sprintf("%s\nمدت: %s ماه\n\nمحدودیت IP هم‌زمان را انتخاب کنید (%d تا %d):", p.Name, st.Vals["months"], p.BaseIP, p.MaxIP), markup(rows...))
+}
+
+func needsCustomPurchaseIP(base, max int) bool {
+	if base < 0 || max < base {
+		return false
+	}
+	return max-base+1 > len(purchaseIPPreview(base, max))
+}
+
+func purchaseIPPreview(base, max int) []int {
+	if base < 0 || max < base {
+		return nil
+	}
+	const previewLimit = 8
+	count := max - base + 1
+	if count > previewLimit {
+		count = previewLimit
+	}
+	choices := make([]int, 0, count)
+	for ip := base; ip < base+count; ip++ {
+		choices = append(choices, ip)
+	}
+	return choices
+}
+
+func validPurchaseIPLimit(ip int, p plan) bool {
+	return p.BaseIP >= 0 && p.MaxIP >= p.BaseIP && ip >= p.BaseIP && ip <= p.MaxIP
 }
 
 func (a *botApp) promptPurchaseName(c telebot.Context, act actor, st conversation) error {
@@ -109,8 +136,15 @@ func (a *botApp) createPurchaseQuote(c telebot.Context, act actor, st conversati
 	months, e1 := strconv.Atoi(st.Vals["months"])
 	ip, e2 := strconv.Atoi(st.Vals["ip"])
 	gb, e3 := strconv.Atoi(st.Vals["gb"])
-	if e1 != nil || e2 != nil || e3 != nil || months < 1 || months > 36 || ip < 0 || ip > 100 || gb < 0 || gb > 100000 {
+	if e1 != nil || e2 != nil || e3 != nil || months < 1 || months > 36 || ip < 0 || gb < 0 || gb > 100000 {
 		return a.home(c, act, "جزئیات خرید نامعتبر است؛ لطفاً خرید را دوباره آغاز کنید.")
+	}
+	p, err := a.planByID(c, st.PlanID)
+	if err != nil {
+		return a.sendFailure(c, err)
+	}
+	if !validPurchaseIPLimit(ip, p) {
+		return a.home(c, act, "محدودیت IP انتخاب‌شده برای این طرح معتبر نیست؛ خرید را دوباره آغاز کنید.")
 	}
 	key := a.operationKey(c, "purchase")
 	var q quote
@@ -166,13 +200,7 @@ func (a *botApp) renderPurchaseInvoice(c telebot.Context, act actor, st conversa
 	if notice != "" {
 		text = notice + "\n\n" + text
 	}
-	methods := []telebot.Btn{}
-	if featureEnabled(features.Features, "wallet_enabled") {
-		methods = append(methods, btn("👛 تأیید و پرداخت از کیف پول", "confirm-purchase|wallet"))
-	}
-	if featureEnabled(features.Features, "direct_payments_enabled") {
-		methods = append(methods, btn("💳 تأیید و پرداخت مستقیم", "confirm-purchase|direct"))
-	}
+	methods := purchaseMethodButtons(features, st.Vals["retry_method"])
 	if len(methods) == 0 {
 		methods = append(methods, btn("بازگشت به خانه", "home"))
 	}
@@ -180,6 +208,9 @@ func (a *botApp) renderPurchaseInvoice(c telebot.Context, act actor, st conversa
 }
 
 func (a *botApp) confirmPurchase(c telebot.Context, act actor, st conversation, method string) error {
+	if !purchaseRetryMethodAllowed(method, st.Vals["retry_method"]) {
+		return a.renderPurchaseInvoice(c, act, st, "نتیجه تلاش قبلی هنوز قطعی نیست و کلید پرداخت به همان روش متصل است. همان روش را دوباره انتخاب کنید؛ برای تغییر روش، خرید را لغو و از ابتدا شروع کنید.")
+	}
 	features := a.runtime(c, act.TelegramID)
 	if method == "wallet" && !featureEnabled(features.Features, "wallet_enabled") || method == "direct" && !featureEnabled(features.Features, "direct_payments_enabled") {
 		return a.renderPurchaseInvoice(c, act, st, "این روش پرداخت در حال حاضر فعال نیست.")
@@ -199,7 +230,16 @@ func (a *botApp) confirmPurchase(c telebot.Context, act actor, st conversation, 
 	}
 	var out purchase
 	if err = a.call(c, "POST", "/v1/purchases", act.TelegramID, map[string]any{"quote_id": quoteID, "payment_method": method, "idempotency_key": "purchase-" + st.Vals["operation_key"], "display_name": st.Vals["name"]}, &out); err != nil {
-		return a.renderPurchaseInvoice(c, act, st, "ثبت پرداخت انجام نشد. همان پیش‌فاکتور را دوباره بررسی کنید یا روش دیگری انتخاب کنید.")
+		st.Vals["retry_method"] = method
+		st.Expires = time.Now().Add(20 * time.Minute)
+		a.setFlow(act.TelegramID, st)
+		return a.renderPurchaseInvoice(c, act, st, "نتیجه ثبت پرداخت نامشخص است؛ این روش را با همان درخواست دوباره امتحان کنید. برای تغییر روش، خرید را لغو و از ابتدا شروع کنید.")
+	}
+	if out.Amount <= 0 || (method == "direct" && out.IntentID <= 0) {
+		st.Vals["retry_method"] = method
+		st.Expires = time.Now().Add(20 * time.Minute)
+		a.setFlow(act.TelegramID, st)
+		return a.renderPurchaseInvoice(c, act, st, "پاسخ ثبت پرداخت ناقص است؛ نتیجه نامشخص است. همان روش را با همان درخواست دوباره امتحان کنید.")
 	}
 	a.clearFlow(act.TelegramID)
 	if method == "wallet" {
@@ -207,6 +247,27 @@ func (a *botApp) confirmPurchase(c telebot.Context, act actor, st conversation, 
 	}
 	text := fmt.Sprintf("فاکتور شماره %d\nمبلغ: %s تومان\n%s", out.IntentID, formatToman(out.Amount), paymentInstructionDetails(instructions))
 	return a.show(c, text, markup([]telebot.Btn{btn("📷 ارسال عکس رسید", fmt.Sprintf("receipt|payment|%d", out.IntentID))}, []telebot.Btn{btn("خانه", "home")}))
+}
+
+func purchaseMethodButtons(features runtimeConfig, retryMethod string) []telebot.Btn {
+	if retryMethod == "wallet" {
+		return []telebot.Btn{btn("🔁 تلاش دوباره با کیف پول", "confirm-purchase|wallet")}
+	}
+	if retryMethod == "direct" {
+		return []telebot.Btn{btn("🔁 تلاش دوباره با پرداخت مستقیم", "confirm-purchase|direct")}
+	}
+	methods := []telebot.Btn{}
+	if featureEnabled(features.Features, "wallet_enabled") {
+		methods = append(methods, btn("👛 تأیید و پرداخت از کیف پول", "confirm-purchase|wallet"))
+	}
+	if featureEnabled(features.Features, "direct_payments_enabled") {
+		methods = append(methods, btn("💳 تأیید و پرداخت مستقیم", "confirm-purchase|direct"))
+	}
+	return methods
+}
+
+func purchaseRetryMethodAllowed(selected, retryMethod string) bool {
+	return retryMethod == "" || selected == retryMethod
 }
 
 func (a *botApp) showWorkItems(c telebot.Context, act actor) error {

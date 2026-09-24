@@ -581,15 +581,33 @@ func (a *botApp) callback(c telebot.Context) error {
 			return a.homeFor(c, "محدودیت IP نامعتبر است.")
 		}
 		ip, e := strconv.Atoi(data[1])
-		if e != nil || ip < 0 || ip > 100 {
+		if e != nil || ip < 0 {
 			return a.homeFor(c, "محدودیت IP نامعتبر است.")
 		}
 		st, ok := a.currentPurchaseFlow(act.TelegramID, "ip")
 		if !ok {
 			return a.homeFor(c, "فرآیند خرید منقضی شده است.")
 		}
+		p, err := a.planByID(c, st.PlanID)
+		if err != nil {
+			return a.sendFailure(c, err)
+		}
+		if !validPurchaseIPLimit(ip, p) {
+			return a.showPurchaseIP(c, act, st)
+		}
 		st.Vals["ip"] = strconv.Itoa(ip)
 		return a.promptPurchaseName(c, act, st)
+	case "ip-custom":
+		st, ok := a.currentPurchaseFlow(act.TelegramID, "ip")
+		if !ok {
+			return a.homeFor(c, "فرآیند خرید منقضی شده است.")
+		}
+		p, err := a.planByID(c, st.PlanID)
+		if err != nil {
+			return a.sendFailure(c, err)
+		}
+		st.Step = "ip-number"
+		return a.setFlowAndPrompt(c, act.TelegramID, st, fmt.Sprintf("تعداد IP هم‌زمان را بین %d تا %d وارد کنید.", p.BaseIP, p.MaxIP))
 	case "purchase-default-name":
 		st, ok := a.currentPurchaseFlow(act.TelegramID, "name")
 		if !ok {
@@ -898,6 +916,20 @@ func (a *botApp) text(c telebot.Context) error {
 			return a.setFlowAndPrompt(c, act.TelegramID, st, "نام سرویس باید بین ۱ تا ۶۴ نویسه باشد؛ برای نام پیش‌فرض «-» بفرستید.")
 		}
 		return a.createPurchaseQuote(c, act, st, name)
+	case "ip-number":
+		ip, e := strconv.Atoi(raw)
+		if e != nil {
+			return a.setFlowAndPrompt(c, act.TelegramID, st, "تعداد IP را به‌صورت عدد صحیح وارد کنید.")
+		}
+		p, e := a.planByID(c, st.PlanID)
+		if e != nil {
+			return a.sendFailure(c, e)
+		}
+		if !validPurchaseIPLimit(ip, p) {
+			return a.setFlowAndPrompt(c, act.TelegramID, st, fmt.Sprintf("محدودیت IP باید بین %d و %d باشد.", p.BaseIP, p.MaxIP))
+		}
+		st.Vals["ip"] = strconv.Itoa(ip)
+		return a.promptPurchaseName(c, act, st)
 	case "topup":
 		amount, e := strconv.ParseInt(raw, 10, 64)
 		min, _ := strconv.ParseInt(st.Vals["min_topup_toman"], 10, 64)
