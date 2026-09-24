@@ -31,26 +31,31 @@ type actor struct {
 	ApprovalStatus string `json:"approval_status"`
 }
 type plan struct {
-	ID               int64  `json:"id"`
-	Name             string `json:"name"`
-	Kind             string `json:"kind"`
-	Enabled          bool   `json:"enabled"`
-	IsLimited        bool   `json:"is_limited"`
-	Description      string `json:"description"`
-	BasePrice        int64  `json:"base_price_toman"`
-	PriceExtraIP     int64  `json:"price_per_extra_ip_toman"`
-	PriceGB          int64  `json:"price_per_gb_toman"`
-	PriceExtraMonth  int64  `json:"price_per_extra_month_toman"`
-	BaseIP           int    `json:"base_ip_limit"`
-	MaxIP            int    `json:"max_ip_limit"`
-	MinGB            int    `json:"min_data_gb"`
-	MaxBytes         int64  `json:"max_data_bytes"`
-	ExpireSeconds    int64  `json:"expire_seconds"`
-	TestIPLimit      int    `json:"test_ip_limit"`
-	MaxPerDay        int    `json:"max_per_day"`
-	Flow             string `json:"flow"`
-	InboundIDs       []int  `json:"inbound_ids"`
-	UsageDescription string `json:"usage_description"`
+	ID               int64          `json:"id"`
+	Name             string         `json:"name"`
+	Kind             string         `json:"kind"`
+	Enabled          bool           `json:"enabled"`
+	IsLimited        bool           `json:"is_limited"`
+	Description      string         `json:"description"`
+	BasePrice        int64          `json:"base_price_toman"`
+	PriceExtraIP     int64          `json:"price_per_extra_ip_toman"`
+	PriceGB          int64          `json:"price_per_gb_toman"`
+	PriceExtraMonth  int64          `json:"price_per_extra_month_toman"`
+	BaseIP           int            `json:"base_ip_limit"`
+	MaxIP            int            `json:"max_ip_limit"`
+	MinGB            int            `json:"min_data_gb"`
+	MaxBytes         int64          `json:"max_data_bytes"`
+	ExpireSeconds    int64          `json:"expire_seconds"`
+	TestIPLimit      int            `json:"test_ip_limit"`
+	MaxPerDay        int            `json:"max_per_day"`
+	Flow             string         `json:"flow"`
+	InboundIDs       []int          `json:"inbound_ids"`
+	UsageDescription string         `json:"usage_description"`
+	DiscountTiers    []discountTier `json:"discount_tiers"`
+}
+type discountTier struct {
+	Months      int   `json:"months"`
+	BasisPoints int64 `json:"basis_points"`
 }
 type quote struct {
 	ID    int64 `json:"id"`
@@ -95,13 +100,15 @@ type settings struct {
 	RetailTrialResetDays      int               `json:"retail_trial_reset_days"`
 	UnapprovedTrialDailyLimit int               `json:"unapproved_trial_daily_limit"`
 	ResellerApprovedRequired  bool              `json:"reseller_approved_required"`
+	MinTopupToman             int64             `json:"min_topup_toman"`
 	Features                  map[string]bool   `json:"features"`
 	Text                      map[string]string `json:"text"`
 }
 type paymentInstructions struct {
-	CardNumber   string `json:"card_number"`
-	CardOwner    string `json:"card_owner"`
-	Instructions string `json:"instructions"`
+	CardNumber    string `json:"card_number"`
+	CardOwner     string `json:"card_owner"`
+	Instructions  string `json:"instructions"`
+	MinTopupToman int64  `json:"min_topup_toman"`
 }
 type panelConfig struct {
 	ID              string `json:"id"`
@@ -418,6 +425,9 @@ func (a *botApp) callback(c telebot.Context) error {
 	if err != nil {
 		return a.sendFailure(c, err)
 	}
+	if isAdmin(act) && adminCallbackAction(data[0]) && !isPrivateChat(c.Chat()) {
+		return a.show(c, "گزینه‌های مدیریت فقط در گفت‌وگوی خصوصی در دسترس هستند.", markup([]telebot.Btn{btn("خانه", "home")}))
+	}
 	switch data[0] {
 	case "home":
 		a.clearFlow(act.TelegramID)
@@ -427,8 +437,16 @@ func (a *botApp) callback(c telebot.Context) error {
 	case "ledger":
 		return a.ledger(c, act)
 	case "topup":
-		a.setFlow(act.TelegramID, conversation{Step: "topup", Expires: time.Now().Add(20 * time.Minute)})
-		return a.show(c, "مبلغ شارژ را به تومان وارد کنید.", markup([]telebot.Btn{btn("لغو", "home")}))
+		features := a.runtime(c, act.TelegramID)
+		if !featureEnabled(features.Features, "topups_enabled") {
+			return a.home(c, act, "شارژ کیف پول در حال حاضر غیرفعال است.")
+		}
+		var instructions paymentInstructions
+		if err := a.call(c, "GET", "/v1/payment-instructions", act.TelegramID, nil, &instructions); err != nil {
+			return a.sendFailure(c, err)
+		}
+		a.setFlow(act.TelegramID, conversation{Step: "topup", Vals: map[string]string{"min_topup_toman": strconv.FormatInt(instructions.MinTopupToman, 10)}, Expires: time.Now().Add(20 * time.Minute)})
+		return a.show(c, topupInstructionsText(instructions), markup([]telebot.Btn{btn("لغو", "home")}))
 	case "services":
 		return a.services(c, act)
 	case "support":
@@ -488,16 +506,118 @@ func (a *botApp) callback(c telebot.Context) error {
 			return a.homeFor(c, "طرح نامعتبر است.")
 		}
 		return a.startPurchase(c, act, id)
-	case "method":
-		if len(data) < 3 {
-			return a.homeFor(c, "انتخاب نامعتبر است.")
+	case "duration":
+		if len(data) < 2 {
+			return a.homeFor(c, "مدت اشتراک نامعتبر است.")
 		}
-		id, e := strconv.ParseInt(data[1], 10, 64)
+		months, e := strconv.Atoi(data[1])
+		if e != nil || months < 1 || months > 36 {
+			return a.homeFor(c, "مدت اشتراک باید بین ۱ تا ۳۶ ماه باشد.")
+		}
+		st, ok := a.currentPurchaseFlow(act.TelegramID, "months")
+		if !ok {
+			return a.homeFor(c, "فرآیند خرید منقضی شده است.")
+		}
+		st.Vals["months"] = strconv.Itoa(months)
+		return a.advancePurchase(c, act, st)
+	case "duration-custom":
+		st, ok := a.currentPurchaseFlow(act.TelegramID, "months")
+		if !ok {
+			return a.homeFor(c, "فرآیند خرید منقضی شده است.")
+		}
+		st.Step = "months"
+		return a.setFlowAndPrompt(c, act.TelegramID, st, "تعداد ماه را بین ۱ تا ۳۶ وارد کنید.")
+	case "back-duration":
+		st, ok := a.purchaseFlow(act.TelegramID)
+		if !ok {
+			return a.homeFor(c, "فرآیند خرید منقضی شده است.")
+		}
+		p, e := a.planByID(c, st.PlanID)
 		if e != nil {
-			return a.homeFor(c, "طرح نامعتبر است.")
+			return a.sendFailure(c, e)
 		}
-		a.setFlow(act.TelegramID, conversation{Step: "months", PlanID: id, Method: data[2], Vals: map[string]string{}, Expires: time.Now().Add(20 * time.Minute)})
-		return a.show(c, "مدت اشتراک را به ماه وارد کنید.", markup([]telebot.Btn{btn("بازگشت", "plans|paid"), btn("خانه", "home")}))
+		st.Step = "months"
+		a.setFlow(act.TelegramID, st)
+		return a.showPurchaseDuration(c, p)
+	case "back-data":
+		st, ok := a.purchaseFlow(act.TelegramID)
+		if !ok {
+			return a.homeFor(c, "فرآیند خرید منقضی شده است.")
+		}
+		p, e := a.planByID(c, st.PlanID)
+		if e != nil {
+			return a.sendFailure(c, e)
+		}
+		return a.showPurchaseData(c, p, st)
+	case "back-ip":
+		st, ok := a.purchaseFlow(act.TelegramID)
+		if !ok {
+			return a.homeFor(c, "فرآیند خرید منقضی شده است.")
+		}
+		return a.showPurchaseIP(c, act, st)
+	case "data":
+		if len(data) < 2 {
+			return a.homeFor(c, "حجم انتخاب شده نامعتبر است.")
+		}
+		gb, e := strconv.Atoi(data[1])
+		if e != nil || gb < 0 || gb > 100000 {
+			return a.homeFor(c, "حجم انتخاب شده نامعتبر است.")
+		}
+		st, ok := a.currentPurchaseFlow(act.TelegramID, "gb")
+		if !ok {
+			return a.homeFor(c, "فرآیند خرید منقضی شده است.")
+		}
+		st.Vals["gb"] = strconv.Itoa(gb)
+		return a.showPurchaseIP(c, act, st)
+	case "data-custom":
+		st, ok := a.currentPurchaseFlow(act.TelegramID, "gb")
+		if !ok {
+			return a.homeFor(c, "فرآیند خرید منقضی شده است.")
+		}
+		st.Step = "gb"
+		return a.setFlowAndPrompt(c, act.TelegramID, st, "حجم دلخواه را به GB وارد کنید.")
+	case "ip":
+		if len(data) < 2 {
+			return a.homeFor(c, "محدودیت IP نامعتبر است.")
+		}
+		ip, e := strconv.Atoi(data[1])
+		if e != nil || ip < 0 || ip > 100 {
+			return a.homeFor(c, "محدودیت IP نامعتبر است.")
+		}
+		st, ok := a.currentPurchaseFlow(act.TelegramID, "ip")
+		if !ok {
+			return a.homeFor(c, "فرآیند خرید منقضی شده است.")
+		}
+		st.Vals["ip"] = strconv.Itoa(ip)
+		return a.promptPurchaseName(c, act, st)
+	case "purchase-default-name":
+		st, ok := a.currentPurchaseFlow(act.TelegramID, "name")
+		if !ok {
+			return a.homeFor(c, "فرآیند خرید منقضی شده است.")
+		}
+		return a.createPurchaseQuote(c, act, st, "")
+	case "confirm-purchase":
+		if len(data) < 2 || (data[1] != "wallet" && data[1] != "direct") {
+			return a.homeFor(c, "روش پرداخت نامعتبر است.")
+		}
+		st, ok := a.currentPurchaseFlow(act.TelegramID, "purchase-confirm")
+		if !ok {
+			return a.homeFor(c, "پیش‌فاکتور منقضی شده است. خرید را دوباره آغاز کنید.")
+		}
+		return a.confirmPurchase(c, act, st, data[1])
+	case "cancel-purchase":
+		a.clearFlow(act.TelegramID)
+		return a.home(c, act, "خرید لغو شد.")
+	case "retry-topup":
+		st, ok := a.currentPurchaseFlow(act.TelegramID, "topup-submit")
+		if !ok {
+			return a.home(c, act, "درخواست شارژ منقضی شده است. از منوی کیف پول دوباره شروع کنید.")
+		}
+		amount, err := strconv.ParseInt(st.Vals["amount_toman"], 10, 64)
+		if err != nil || amount <= 0 || st.Vals["operation_key"] == "" {
+			return a.home(c, act, "درخواست شارژ نامعتبر است. از منوی کیف پول دوباره شروع کنید.")
+		}
+		return a.createTopup(c, act, amount, st.Vals["operation_key"])
 	case "receipt":
 		if len(data) < 3 {
 			return a.homeFor(c, "شناسه نامعتبر است.")
@@ -533,6 +653,16 @@ func (a *botApp) callback(c telebot.Context) error {
 			return a.homeFor(c, "این بخش در دسترس نیست.")
 		}
 		return a.adminHome(c, act)
+	case "work-items":
+		if !isAdmin(act) {
+			return a.homeFor(c, "این بخش در دسترس نیست.")
+		}
+		return a.showWorkItems(c, act)
+	case "refunds":
+		if !isAdmin(act) {
+			return a.homeFor(c, "این بخش در دسترس نیست.")
+		}
+		return a.showRefunds(c, act)
 	case "pending", "pendingtopups":
 		if !isAdmin(act) {
 			return a.homeFor(c, "این بخش در دسترس نیست.")
@@ -624,7 +754,9 @@ func (a *botApp) showPlans(c telebot.Context, act actor, kind string) error {
 		return a.show(c, "در حال حاضر طرحی در دسترس نیست.", markup([]telebot.Btn{btn("خانه", "home")}))
 	}
 	rows := make([][]telebot.Btn, 0, len(items)+1)
+	var summary strings.Builder
 	for _, p := range items {
+		fmt.Fprintf(&summary, "%s\n", formatPlanDetails(p, kind))
 		label := p.Name
 		if kind == "test" {
 			label = fmt.Sprintf("🧪 %s · تست روزانه", p.Name)
@@ -643,8 +775,33 @@ func (a *botApp) showPlans(c telebot.Context, act actor, kind string) error {
 	title := "طرح‌های خرید"
 	if kind == "test" {
 		title = "طرح‌های تست. هر درخواست یک کاربر است؛ تست گروهی غیرفعال است."
+	} else {
+		title = "طرح‌های خرید\n\n" + strings.TrimSpace(summary.String())
+	}
+	if kind == "test" {
+		title += "\n\n" + strings.TrimSpace(summary.String())
 	}
 	return a.show(c, title, markup(rows...))
+}
+
+func (a *botApp) planByID(c telebot.Context, id int64) (plan, error) {
+	if id <= 0 {
+		return plan{}, fmt.Errorf("invalid plan id")
+	}
+	var items []plan
+	actorID := int64(0)
+	if c.Sender() != nil {
+		actorID = c.Sender().ID
+	}
+	if err := a.call(c, "GET", "/v1/plans?kind=paid", actorID, nil, &items); err != nil {
+		return plan{}, err
+	}
+	for _, item := range items {
+		if item.ID == id {
+			return item, nil
+		}
+	}
+	return plan{}, fmt.Errorf("plan not found")
 }
 func (a *botApp) submitTrial(c telebot.Context, act actor, id int64) error {
 	key := a.operationKey(c, fmt.Sprintf("trial-%d", id))
@@ -655,20 +812,13 @@ func (a *botApp) submitTrial(c telebot.Context, act actor, id int64) error {
 	return a.show(c, "درخواست تست ثبت شد و برای بررسی سهمیه روزانه و وضعیت تأیید reseller پردازش می‌شود.", markup([]telebot.Btn{btn("طرح‌های تست", "plans|test"), btn("خانه", "home")}))
 }
 func (a *botApp) startPurchase(c telebot.Context, act actor, id int64) error {
-	a.setFlow(act.TelegramID, conversation{Step: "method", PlanID: id, Vals: map[string]string{}, Expires: time.Now().Add(20 * time.Minute)})
-	runtime := a.runtime(c, act.TelegramID)
-	methods := []telebot.Btn{}
-	if featureEnabled(runtime.Features, "wallet_enabled") {
-		methods = append(methods, btn("پرداخت از کیف پول", "method|"+strconv.FormatInt(id, 10)+"|wallet"))
+	p, err := a.planByID(c, id)
+	if err != nil {
+		return a.sendFailure(c, err)
 	}
-	if featureEnabled(runtime.Features, "direct_payments_enabled") {
-		methods = append(methods, btn("پرداخت مستقیم", "method|"+strconv.FormatInt(id, 10)+"|direct"))
-	}
-	if len(methods) == 0 {
-		a.clearFlow(act.TelegramID)
-		return a.show(c, "روش پرداخت فعالی وجود ندارد.", markup([]telebot.Btn{btn("بازگشت", "plans|paid"), btn("خانه", "home")}))
-	}
-	return a.show(c, "روش پرداخت را انتخاب کنید.", markup(methods, []telebot.Btn{btn("بازگشت", "plans|paid"), btn("خانه", "home")}))
+	st := conversation{Step: "months", PlanID: id, Vals: map[string]string{}, Expires: time.Now().Add(20 * time.Minute)}
+	a.setFlow(act.TelegramID, st)
+	return a.showPurchaseDuration(c, p)
 }
 func (a *botApp) text(c telebot.Context) error {
 	if c.Sender() == nil {
@@ -688,6 +838,10 @@ func (a *botApp) text(c telebot.Context) error {
 	if !ok || time.Now().After(st.Expires) {
 		a.clearFlow(act.TelegramID)
 		return a.home(c, act, "از منو گزینه‌ای را انتخاب کنید.")
+	}
+	if isAdmin(act) && adminFlowStep(st.Step) && !isPrivateChat(c.Chat()) {
+		a.clearFlow(act.TelegramID)
+		return c.Send("تنظیمات مدیریت فقط در گفت‌وگوی خصوصی قابل تغییر هستند. از /admin در گفت‌وگوی خصوصی شروع کنید.")
 	}
 	if st.Step == "paneltoken" {
 		err := submitPanelToken(c.Chat(), c.Delete, func() error {
@@ -715,38 +869,50 @@ func (a *botApp) text(c telebot.Context) error {
 		return a.home(c, act, "عملیات لغو شد.")
 	}
 	switch st.Step {
-	case "months", "ip", "gb", "name":
-		if _, err := strconv.Atoi(raw); st.Step != "name" && err != nil {
-			return a.show(c, "لطفاً فقط عدد معتبر بفرستید.", markup([]telebot.Btn{btn("لغو", "home")}))
+	case "months":
+		months, e := strconv.Atoi(raw)
+		if e != nil || months < 1 || months > 36 {
+			return a.setFlowAndPrompt(c, act.TelegramID, st, "مدت را به‌صورت عددی بین ۱ تا ۳۶ ماه بفرستید.")
 		}
-		if st.Vals == nil {
-			st.Vals = map[string]string{}
+		st.Vals["months"] = strconv.Itoa(months)
+		return a.advancePurchase(c, act, st)
+	case "gb":
+		gb, e := strconv.Atoi(raw)
+		if e != nil || gb < 0 || gb > 100000 {
+			return a.setFlowAndPrompt(c, act.TelegramID, st, "حجم باید عددی بین صفر تا ۱۰۰۰۰۰ گیگابایت باشد.")
 		}
-		st.Vals[st.Step] = raw
-		switch st.Step {
-		case "months":
-			st.Step = "ip"
-			return a.setFlowAndPrompt(c, act.TelegramID, st, "تعداد IP مجاز را وارد کنید.")
-		case "ip":
-			st.Step = "gb"
-			return a.setFlowAndPrompt(c, act.TelegramID, st, "حجم را بر حسب GB وارد کنید؛ برای نامحدود عدد 0.")
-		case "gb":
-			st.Step = "name"
-			return a.setFlowAndPrompt(c, act.TelegramID, st, "نام سرویس را وارد کنید؛ برای نام پیش‌فرض «-» بفرستید.")
+		p, e := a.planByID(c, st.PlanID)
+		if e != nil {
+			return a.sendFailure(c, e)
 		}
-		name := raw
+		if gb < p.MinGB {
+			return a.setFlowAndPrompt(c, act.TelegramID, st, fmt.Sprintf("حداقل حجم این طرح %d گیگابایت است. مقدار دیگری بفرستید.", p.MinGB))
+		}
+		st.Vals["gb"] = strconv.Itoa(gb)
+		return a.showPurchaseIP(c, act, st)
+	case "name":
+		name := strings.TrimSpace(raw)
 		if name == "-" {
 			name = ""
+		} else if name == "" || utf8.RuneCountInString(name) > 64 {
+			return a.setFlowAndPrompt(c, act.TelegramID, st, "نام سرویس باید بین ۱ تا ۶۴ نویسه باشد؛ برای نام پیش‌فرض «-» بفرستید.")
 		}
-		a.clearFlow(act.TelegramID)
-		return a.createPurchase(c, act, st, name)
+		return a.createPurchaseQuote(c, act, st, name)
 	case "topup":
 		amount, e := strconv.ParseInt(raw, 10, 64)
+		min, _ := strconv.ParseInt(st.Vals["min_topup_toman"], 10, 64)
 		if e != nil || amount <= 0 {
-			return a.show(c, "مبلغ را به تومان و به شکل عدد مثبت وارد کنید.", markup([]telebot.Btn{btn("لغو", "home")}))
+			return a.setFlowAndPrompt(c, act.TelegramID, st, "مبلغ شارژ را به تومان و به شکل عدد مثبت وارد کنید.")
 		}
-		a.clearFlow(act.TelegramID)
-		return a.createTopup(c, act, amount)
+		if err := validateTopupAmount(amount, min); err != nil {
+			return a.setFlowAndPrompt(c, act.TelegramID, st, fmt.Sprintf("حداقل مبلغ شارژ %s تومان است. مبلغ دیگری وارد کنید.", formatToman(min)))
+		}
+		st.Step = "topup-submit"
+		st.Vals["amount_toman"] = strconv.FormatInt(amount, 10)
+		st.Vals["operation_key"] = a.operationKey(c, "topup")
+		st.Expires = time.Now().Add(20 * time.Minute)
+		a.setFlow(act.TelegramID, st)
+		return a.createTopup(c, act, amount, st.Vals["operation_key"])
 	case "cancelid":
 		id, e := strconv.ParseInt(raw, 10, 64)
 		if e != nil || id <= 0 {
@@ -791,6 +957,15 @@ func isPrivateChat(chat *telebot.Chat) bool {
 	return chat != nil && chat.Type == telebot.ChatPrivate
 }
 
+func adminFlowStep(step string) bool {
+	switch step {
+	case "cfgvalue", "cfgtextkey", "planvalue", "plancreate", "paneltoken":
+		return true
+	default:
+		return false
+	}
+}
+
 // submitPanelToken removes the message containing the credential before the
 // credential is sent to the backend. A failed delete stops the update.
 func submitPanelToken(chat *telebot.Chat, deleteMessage func() error, submit func() error) error {
@@ -807,36 +982,27 @@ func (a *botApp) setFlowAndPrompt(c telebot.Context, id int64, st conversation, 
 	a.setFlow(id, st)
 	return a.show(c, prompt, markup([]telebot.Btn{btn("لغو", "home")}))
 }
-func (a *botApp) createPurchase(c telebot.Context, act actor, st conversation, name string) error {
-	vals := st.Vals
-	months, _ := strconv.Atoi(vals["months"])
-	ip, _ := strconv.Atoi(vals["ip"])
-	gb, _ := strconv.Atoi(vals["gb"])
-	key := a.operationKey(c, "purchase")
-	var q quote
-	if err := a.call(c, "POST", "/v1/quotes", act.TelegramID, map[string]any{"plan_id": st.PlanID, "months": months, "ip_limit": ip, "data_gb": gb, "idempotency_key": "quote-" + key}, &q); err != nil {
-		return a.sendFailure(c, err)
-	}
-	var out purchase
-	if err := a.call(c, "POST", "/v1/purchases", act.TelegramID, map[string]any{"quote_id": q.ID, "payment_method": st.Method, "idempotency_key": "purchase-" + key, "display_name": name}, &out); err != nil {
-		return a.sendFailure(c, err)
-	}
-	if st.Method == "wallet" {
-		return a.show(c, fmt.Sprintf("خرید ثبت شد. مبلغ %d تومان؛ وضعیت: %s.", out.Amount, out.Status), markup([]telebot.Btn{btn("سرویس‌های من", "services"), btn("خانه", "home")}))
-	}
+func (a *botApp) createTopup(c telebot.Context, act actor, amount int64, key string) error {
 	var instructions paymentInstructions
 	if err := a.call(c, "GET", "/v1/payment-instructions", act.TelegramID, nil, &instructions); err != nil {
-		return a.sendFailure(c, err)
+		return a.show(c, "اطلاعات پرداخت دریافت نشد؛ درخواست شارژ ثبت نشده است. پس از بررسی دوباره تلاش کنید.", markup([]telebot.Btn{btn("تلاش دوباره", "retry-topup")}, []telebot.Btn{btn("لغو", "home")}))
 	}
-	return a.show(c, fmt.Sprintf("فاکتور شماره %d\nمبلغ: %d تومان\nشماره کارت: %s\nصاحب کارت: %s\n%s", out.IntentID, out.Amount, instructions.CardNumber, instructions.CardOwner, instructions.Instructions), markup([]telebot.Btn{btn("ارسال عکس رسید", fmt.Sprintf("receipt|payment|%d", out.IntentID))}, []telebot.Btn{btn("خانه", "home")}))
-}
-func (a *botApp) createTopup(c telebot.Context, act actor, amount int64) error {
-	var out map[string]any
-	if err := a.call(c, "POST", "/v1/wallet/topups", act.TelegramID, map[string]any{"amount_toman": amount, "idempotency_key": a.operationKey(c, "topup")}, &out); err != nil {
-		return a.sendFailure(c, err)
+	if !validPaymentDestination(instructions) {
+		return a.show(c, "اطلاعات کارت پرداخت کامل نیست؛ درخواست شارژ ثبت نشده است. مدیر باید شماره کارت و نام صاحب کارت را تنظیم کند.", markup([]telebot.Btn{btn("تلاش دوباره", "retry-topup")}, []telebot.Btn{btn("لغو", "home")}))
 	}
-	id := fmt.Sprint(out["topup_id"])
-	return a.show(c, "درخواست شارژ ثبت شد.", markup([]telebot.Btn{btn("ارسال عکس رسید", "receipt|topup|"+id)}, []telebot.Btn{btn("خانه", "home")}))
+	var out struct {
+		TopupID int64  `json:"topup_id"`
+		Status  string `json:"status"`
+	}
+	if err := a.call(c, "POST", "/v1/wallet/topups", act.TelegramID, map[string]any{"amount_toman": amount, "idempotency_key": key}, &out); err != nil {
+		return a.show(c, "ثبت درخواست شارژ تأیید نشد. برای بررسی نتیجه، همین درخواست را با همان کلید امن دوباره امتحان کنید.", markup([]telebot.Btn{btn("تلاش دوباره", "retry-topup")}, []telebot.Btn{btn("لغو", "home")}))
+	}
+	if out.TopupID <= 0 || out.Status != "awaiting_receipt" {
+		return a.show(c, "نتیجه ثبت شارژ تأیید نشد. برای بررسی نتیجه، همین درخواست را با همان کلید امن دوباره امتحان کنید.", markup([]telebot.Btn{btn("تلاش دوباره", "retry-topup")}, []telebot.Btn{btn("لغو", "home")}))
+	}
+	a.clearFlow(act.TelegramID)
+	text := fmt.Sprintf("درخواست شارژ شماره %d ثبت شد.\nمبلغ: %s تومان\n%s", out.TopupID, formatToman(amount), paymentInstructionDetails(instructions))
+	return a.show(c, text, markup([]telebot.Btn{btn("📷 ارسال عکس رسید", fmt.Sprintf("receipt|topup|%d", out.TopupID))}, []telebot.Btn{btn("خانه", "home")}))
 }
 func (a *botApp) photo(c telebot.Context) error {
 	if c.Sender() == nil {
@@ -1047,7 +1213,7 @@ const maxSubscriptionLinkChunk = 2500
 const maxSubscriptionPageRunes = 3600
 
 func (a *botApp) adminHome(c telebot.Context, act actor) error {
-	return a.show(c, "مدیریت فقط برای مدیر پیکربندی‌شده در این deployment در دسترس است.", markup([]telebot.Btn{btn("درخواست‌های reseller", "resellers")}, []telebot.Btn{btn("پرداخت‌های در انتظار", "pending"), btn("شارژهای در انتظار", "pendingtopups")}, []telebot.Btn{btn("تنظیمات ربات و طرح‌ها", "config")}, []telebot.Btn{btn("خانه", "home")}))
+	return a.show(c, "مدیریت فقط برای مدیر پیکربندی‌شده در این deployment در دسترس است.", markup([]telebot.Btn{btn("درخواست‌های reseller", "resellers")}, []telebot.Btn{btn("پرداخت‌های در انتظار", "pending"), btn("شارژهای در انتظار", "pendingtopups")}, []telebot.Btn{btn("کارهای عملیاتی", "work-items"), btn("استردادهای در انتظار", "refunds")}, []telebot.Btn{btn("تنظیمات ربات و طرح‌ها", "config")}, []telebot.Btn{btn("خانه", "home")}))
 }
 func (a *botApp) pendingResellers(c telebot.Context, act actor) error {
 	var items []map[string]any
@@ -1189,13 +1355,13 @@ func (a *botApp) configSettings(c telebot.Context, act actor) error {
 	if err := a.call(c, "GET", "/v1/admin/config", act.TelegramID, nil, &cfg); err != nil {
 		return a.sendFailure(c, err)
 	}
-	rows := [][]telebot.Btn{{btn(fmt.Sprintf("سهمیه روزانه نامؤید: %d", cfg.Settings.UnapprovedTrialDailyLimit), "cfgset|settings|unapproved_trial_daily_limit")}, {btn(resellerApprovalButtonLabel(cfg.Settings.ResellerApprovedRequired), "cfgset|settings|reseller_approved_required")}}
+	rows := [][]telebot.Btn{{btn(fmt.Sprintf("سهمیه روزانه نامؤید: %d", cfg.Settings.UnapprovedTrialDailyLimit), "cfgset|settings|unapproved_trial_daily_limit")}, {btn(resellerApprovalButtonLabel(cfg.Settings.ResellerApprovedRequired), "cfgset|settings|reseller_approved_required")}, {btn(fmt.Sprintf("حداقل شارژ: %s تومان", formatToman(cfg.Settings.MinTopupToman)), "cfgset|settings|min_topup_toman")}}
 	keys := []string{"purchases_enabled", "trials_enabled", "wallet_enabled", "topups_enabled", "direct_payments_enabled"}
 	for _, key := range keys {
 		rows = append(rows, []telebot.Btn{btn(fmt.Sprintf("%s: %t (تغییر)", key, featureEnabled(cfg.Settings.Features, key)), "feature|"+key)})
 	}
 	rows = append(rows, []telebot.Btn{btn("بازگشت", "config")})
-	return a.show(c, fmt.Sprintf("سهمیه تست روزانه: %d. تأیید و قابلیت‌ها در backend هم اعمال می‌شوند.", cfg.Settings.UnapprovedTrialDailyLimit), markup(rows...))
+	return a.show(c, fmt.Sprintf("سهمیه تست روزانه: %d. حداقل شارژ: %s تومان. این محدودیت‌ها و قابلیت‌ها در backend هم اعمال می‌شوند.", cfg.Settings.UnapprovedTrialDailyLimit, formatToman(cfg.Settings.MinTopupToman)), markup(rows...))
 }
 func resellerApprovalButtonLabel(required bool) string {
 	if required {
@@ -1313,6 +1479,12 @@ func (a *botApp) saveConfigValue(c telebot.Context, act actor, st conversation, 
 			v, e := strconv.ParseBool(value)
 			if e != nil {
 				return a.show(c, "فقط true یا false وارد کنید.")
+			}
+			payload[field] = v
+		} else if field == "min_topup_toman" {
+			v, e := strconv.ParseInt(value, 10, 64)
+			if e != nil || v < 0 {
+				return a.show(c, "حداقل شارژ باید عدد صحیح نامنفی و به تومان باشد.")
 			}
 			payload[field] = v
 		}

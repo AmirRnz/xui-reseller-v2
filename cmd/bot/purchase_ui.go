@@ -1,0 +1,363 @@
+package main
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"gopkg.in/telebot.v3"
+)
+
+func adminCallbackAction(action string) bool {
+	switch action {
+	case "admin", "pending", "pendingtopups", "resellers", "resapprove", "resreject", "approve", "approvetopup", "work-items", "refunds", "config", "cfg", "cfgset", "planedit", "planfield", "feature":
+		return true
+	default:
+		return false
+	}
+}
+
+func (a *botApp) currentPurchaseFlow(id int64, step string) (conversation, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	st, ok := a.flows[id]
+	if !ok || time.Now().After(st.Expires) || st.Step != step || st.Vals == nil {
+		return conversation{}, false
+	}
+	return st, true
+}
+
+func (a *botApp) purchaseFlow(id int64) (conversation, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	st, ok := a.flows[id]
+	if !ok || time.Now().After(st.Expires) || st.Vals == nil {
+		return conversation{}, false
+	}
+	return st, true
+}
+
+func (a *botApp) showPurchaseDuration(c telebot.Context, p plan) error {
+	rows := [][]telebot.Btn{{btn("۱ ماهه", "duration|1"), btn("۳ ماهه", "duration|3")}, {btn("۶ ماهه", "duration|6"), btn("✏️ مدت دلخواه", "duration-custom")}, {btn("بازگشت به طرح‌ها", "plans|paid"), btn("خانه", "home")}}
+	return a.show(c, formatPlanDetails(p, "paid")+"\n\nمدت سرویس را انتخاب کنید:", markup(rows...))
+}
+
+func (a *botApp) advancePurchase(c telebot.Context, act actor, st conversation) error {
+	p, err := a.planByID(c, st.PlanID)
+	if err != nil {
+		return a.sendFailure(c, err)
+	}
+	if p.IsLimited {
+		return a.showPurchaseData(c, p, st)
+	}
+	return a.showPurchaseIP(c, act, st)
+}
+
+func (a *botApp) showPurchaseData(c telebot.Context, p plan, st conversation) error {
+	min := p.MinGB
+	if min < 1 {
+		min = 1
+	}
+	st.Step = "gb"
+	a.setFlow(c.Sender().ID, st)
+	rows := [][]telebot.Btn{{btn(fmt.Sprintf("%d GB", min), fmt.Sprintf("data|%d", min)), btn(fmt.Sprintf("%d GB", min+10), fmt.Sprintf("data|%d", min+10))}, {btn(fmt.Sprintf("%d GB", min+30), fmt.Sprintf("data|%d", min+30)), btn(fmt.Sprintf("%d GB", min+50), fmt.Sprintf("data|%d", min+50))}, {btn("✏️ حجم دلخواه", "data-custom")}, {btn("بازگشت", "back-duration"), btn("خانه", "home")}}
+	return a.show(c, fmt.Sprintf("%s\n\nحجم را انتخاب کنید یا مقدار دلخواه را وارد کنید (حداقل %d GB):", formatPlanDetails(p, "paid"), min), markup(rows...))
+}
+
+func (a *botApp) showPurchaseIP(c telebot.Context, act actor, st conversation) error {
+	p, err := a.planByID(c, st.PlanID)
+	if err != nil {
+		return a.sendFailure(c, err)
+	}
+	st.Step = "ip"
+	a.setFlow(act.TelegramID, st)
+	rows := make([][]telebot.Btn, 0, 10)
+	max := p.MaxIP
+	if max < p.BaseIP {
+		max = p.BaseIP
+	}
+	for ip := p.BaseIP; ip <= max && len(rows) < 8; ip++ {
+		label := fmt.Sprintf("%d IP هم‌زمان", ip)
+		if ip == 0 {
+			label = "IP هم‌زمان نامحدود"
+		}
+		rows = append(rows, []telebot.Btn{btn(label, fmt.Sprintf("ip|%d", ip))})
+	}
+	back := "back-duration"
+	if p.IsLimited {
+		back = "back-data"
+	}
+	rows = append(rows, []telebot.Btn{btn("بازگشت", back), btn("خانه", "home")})
+	return a.show(c, fmt.Sprintf("%s\nمدت: %s ماه\n\nمحدودیت IP هم‌زمان را انتخاب کنید:", p.Name, st.Vals["months"]), markup(rows...))
+}
+
+func (a *botApp) promptPurchaseName(c telebot.Context, act actor, st conversation) error {
+	st.Step = "name"
+	a.setFlow(act.TelegramID, st)
+	return a.show(c, "نام دلخواه سرویس را بفرستید؛ برای نام پیش‌فرض دکمه را بزنید یا «-» ارسال کنید.", markup([]telebot.Btn{btn("🎲 نام پیش‌فرض", "purchase-default-name")}, []telebot.Btn{btn("بازگشت", "back-ip"), btn("خانه", "home")}))
+}
+
+func (a *botApp) createPurchaseQuote(c telebot.Context, act actor, st conversation, name string) error {
+	if st.Step != "name" || st.Vals == nil {
+		return a.home(c, act, "فرآیند خرید منقضی شده است.")
+	}
+	if utf8.RuneCountInString(name) > 64 {
+		return a.setFlowAndPrompt(c, act.TelegramID, st, "نام سرویس حداکثر ۶۴ نویسه می‌تواند باشد.")
+	}
+	months, e1 := strconv.Atoi(st.Vals["months"])
+	ip, e2 := strconv.Atoi(st.Vals["ip"])
+	gb, e3 := strconv.Atoi(st.Vals["gb"])
+	if e1 != nil || e2 != nil || e3 != nil || months < 1 || months > 36 || ip < 0 || ip > 100 || gb < 0 || gb > 100000 {
+		return a.home(c, act, "جزئیات خرید نامعتبر است؛ لطفاً خرید را دوباره آغاز کنید.")
+	}
+	key := a.operationKey(c, "purchase")
+	var q quote
+	if err := a.call(c, "POST", "/v1/quotes", act.TelegramID, map[string]any{"plan_id": st.PlanID, "months": months, "ip_limit": ip, "data_gb": gb, "idempotency_key": "quote-" + key}, &q); err != nil {
+		return a.sendFailure(c, err)
+	}
+	if q.ID <= 0 || q.Price <= 0 {
+		return a.show(c, "پیش‌فاکتور معتبر از backend دریافت نشد. خرید ثبت نشده است.", markup([]telebot.Btn{btn("خانه", "home")}))
+	}
+	st.Step = "purchase-confirm"
+	st.Vals["quote_id"] = strconv.FormatInt(q.ID, 10)
+	st.Vals["amount_toman"] = strconv.FormatInt(q.Price, 10)
+	st.Vals["operation_key"] = key
+	st.Vals["name"] = name
+	st.Expires = time.Now().Add(20 * time.Minute)
+	a.setFlow(act.TelegramID, st)
+	return a.renderPurchaseInvoice(c, act, st, "")
+}
+
+func (a *botApp) renderPurchaseInvoice(c telebot.Context, act actor, st conversation, notice string) error {
+	quoteID, _ := strconv.ParseInt(st.Vals["quote_id"], 10, 64)
+	amount, _ := strconv.ParseInt(st.Vals["amount_toman"], 10, 64)
+	months, _ := strconv.Atoi(st.Vals["months"])
+	ip, _ := strconv.Atoi(st.Vals["ip"])
+	gb, _ := strconv.Atoi(st.Vals["gb"])
+	if quoteID <= 0 || amount <= 0 {
+		return a.home(c, act, "پیش‌فاکتور منقضی شده است.")
+	}
+	p, err := a.planByID(c, st.PlanID)
+	if err != nil {
+		return a.sendFailure(c, err)
+	}
+	name := strings.TrimSpace(st.Vals["name"])
+	if name == "" {
+		name = "نام پیش‌فرض (توسط سیستم انتخاب می‌شود)"
+	}
+	data := "نامحدود"
+	if p.IsLimited {
+		data = fmt.Sprintf("%d GB", gb)
+	}
+	text := fmt.Sprintf("🧾 پیش‌فاکتور خرید\n\nطرح: %s\nنام سرویس: %s\nمدت: %d ماه\nحجم: %s\nIP هم‌زمان: %s\nمبلغ کل: %s تومان", p.Name, name, months, data, formatIPLimit(ip), formatToman(amount))
+	features := a.runtime(c, act.TelegramID)
+	if featureEnabled(features.Features, "wallet_enabled") {
+		var wallet struct {
+			Balance int64 `json:"balance_toman"`
+		}
+		if err := a.call(c, "GET", "/v1/wallet", act.TelegramID, nil, &wallet); err == nil {
+			text += fmt.Sprintf("\nموجودی کیف پول: %s تومان", formatToman(wallet.Balance))
+		} else {
+			text += "\nموجودی کیف پول: در دسترس نیست"
+		}
+	}
+	if notice != "" {
+		text = notice + "\n\n" + text
+	}
+	methods := []telebot.Btn{}
+	if featureEnabled(features.Features, "wallet_enabled") {
+		methods = append(methods, btn("👛 تأیید و پرداخت از کیف پول", "confirm-purchase|wallet"))
+	}
+	if featureEnabled(features.Features, "direct_payments_enabled") {
+		methods = append(methods, btn("💳 تأیید و پرداخت مستقیم", "confirm-purchase|direct"))
+	}
+	if len(methods) == 0 {
+		methods = append(methods, btn("بازگشت به خانه", "home"))
+	}
+	return a.show(c, text+"\n\nبا انتخاب روش پرداخت، این مبلغ و شرایط را تأیید می‌کنید.", markup(methods, []telebot.Btn{btn("❌ لغو خرید", "cancel-purchase")}))
+}
+
+func (a *botApp) confirmPurchase(c telebot.Context, act actor, st conversation, method string) error {
+	features := a.runtime(c, act.TelegramID)
+	if method == "wallet" && !featureEnabled(features.Features, "wallet_enabled") || method == "direct" && !featureEnabled(features.Features, "direct_payments_enabled") {
+		return a.renderPurchaseInvoice(c, act, st, "این روش پرداخت در حال حاضر فعال نیست.")
+	}
+	var instructions paymentInstructions
+	if method == "direct" {
+		if err := a.call(c, "GET", "/v1/payment-instructions", act.TelegramID, nil, &instructions); err != nil {
+			return a.renderPurchaseInvoice(c, act, st, "اطلاعات پرداخت مستقیم دریافت نشد؛ هیچ فاکتوری ثبت نشده است. پس از بررسی دوباره تلاش کنید یا کیف پول را انتخاب کنید.")
+		}
+		if !validPaymentDestination(instructions) {
+			return a.renderPurchaseInvoice(c, act, st, "اطلاعات کارت پرداخت کامل نیست؛ هیچ فاکتوری ثبت نشده است. مدیر باید شماره کارت و نام صاحب کارت را تنظیم کند.")
+		}
+	}
+	quoteID, err := strconv.ParseInt(st.Vals["quote_id"], 10, 64)
+	if err != nil || quoteID <= 0 || st.Vals["operation_key"] == "" {
+		return a.home(c, act, "پیش‌فاکتور معتبر نیست؛ لطفاً خرید را دوباره آغاز کنید.")
+	}
+	var out purchase
+	if err = a.call(c, "POST", "/v1/purchases", act.TelegramID, map[string]any{"quote_id": quoteID, "payment_method": method, "idempotency_key": "purchase-" + st.Vals["operation_key"], "display_name": st.Vals["name"]}, &out); err != nil {
+		return a.renderPurchaseInvoice(c, act, st, "ثبت پرداخت انجام نشد. همان پیش‌فاکتور را دوباره بررسی کنید یا روش دیگری انتخاب کنید.")
+	}
+	a.clearFlow(act.TelegramID)
+	if method == "wallet" {
+		return a.show(c, fmt.Sprintf("خرید ثبت شد. مبلغ %s تومان؛ وضعیت: %s.", formatToman(out.Amount), out.Status), markup([]telebot.Btn{btn("سرویس‌های من", "services"), btn("خانه", "home")}))
+	}
+	text := fmt.Sprintf("فاکتور شماره %d\nمبلغ: %s تومان\n%s", out.IntentID, formatToman(out.Amount), paymentInstructionDetails(instructions))
+	return a.show(c, text, markup([]telebot.Btn{btn("📷 ارسال عکس رسید", fmt.Sprintf("receipt|payment|%d", out.IntentID))}, []telebot.Btn{btn("خانه", "home")}))
+}
+
+func (a *botApp) showWorkItems(c telebot.Context, act actor) error {
+	var items []map[string]any
+	if err := a.call(c, "GET", "/v1/admin/work-items", act.TelegramID, nil, &items); err != nil {
+		return a.sendFailure(c, err)
+	}
+	if len(items) == 0 {
+		return a.show(c, "هیچ کار عملیاتی ثبت نشده است.", markup([]telebot.Btn{btn("مدیریت", "admin")}))
+	}
+	var text strings.Builder
+	if len(items) > 20 {
+		items = items[:20]
+	}
+	for _, item := range items {
+		fmt.Fprintf(&text, "کار #%v · %v · وضعیت: %v · مرحله: %v · تلاش: %v\n", item["id"], item["kind"], item["status"], item["phase"], item["attempts"])
+	}
+	return a.show(c, strings.TrimSpace(text.String()), markup([]telebot.Btn{btn("مدیریت", "admin")}))
+}
+
+func (a *botApp) showRefunds(c telebot.Context, act actor) error {
+	var items []struct {
+		ID             int64  `json:"id"`
+		SubscriptionID int64  `json:"subscription_id"`
+		Status         string `json:"status"`
+		Suggested      int64  `json:"suggested_amount_toman"`
+		Cap            int64  `json:"refundable_cap_toman"`
+		Reason         string `json:"reason"`
+	}
+	if err := a.call(c, "GET", "/v1/admin/refunds", act.TelegramID, nil, &items); err != nil {
+		return a.sendFailure(c, err)
+	}
+	if len(items) == 0 {
+		return a.show(c, "درخواست استرداد معوقی وجود ندارد.", markup([]telebot.Btn{btn("مدیریت", "admin")}))
+	}
+	var text strings.Builder
+	for _, item := range items {
+		fmt.Fprintf(&text, "درخواست #%d · سرویس #%d · مبلغ پیشنهادی %s تومان (سقف %s)\nدلیل: %s\n\n", item.ID, item.SubscriptionID, formatToman(item.Suggested), formatToman(item.Cap), item.Reason)
+	}
+	return a.show(c, strings.TrimSpace(text.String()), markup([]telebot.Btn{btn("مدیریت", "admin")}))
+}
+
+func formatPlanDetails(p plan, kind string) string {
+	var b strings.Builder
+	if kind == "test" {
+		data := "نامحدود"
+		if p.MaxBytes > 0 {
+			data = fmt.Sprintf("%.2f GB", float64(p.MaxBytes)/1073741824)
+		}
+		fmt.Fprintf(&b, "🧪 %s\nمدت اعتبار: %s (از اولین اتصال)\nحجم: %s", p.Name, humanDuration(p.ExpireSeconds), data)
+		if p.TestIPLimit > 0 {
+			fmt.Fprintf(&b, "\nIP هم‌زمان: %d", p.TestIPLimit)
+		}
+		if p.MaxPerDay > 0 {
+			fmt.Fprintf(&b, "\nسقف روزانه طرح: %d", p.MaxPerDay)
+		}
+	} else if p.IsLimited {
+		fmt.Fprintf(&b, "📦 %s (حجمی)\nقیمت هر GB: %s تومان\nحداقل حجم: %d GB\nماه اضافه: %s تومان\nIP هم‌زمان: %d تا %d\nهر IP اضافه: %s تومان/ماه", p.Name, formatToman(p.PriceGB), p.MinGB, formatToman(p.PriceExtraMonth), p.BaseIP, p.MaxIP, formatToman(p.PriceExtraIP))
+	} else {
+		fmt.Fprintf(&b, "📦 %s (نامحدود)\nقیمت پایه: %s تومان/ماه\nIP هم‌زمان: %d تا %d\nهر IP اضافه: %s تومان/ماه", p.Name, formatToman(p.BasePrice), p.BaseIP, p.MaxIP, formatToman(p.PriceExtraIP))
+	}
+	if strings.TrimSpace(p.Description) != "" {
+		fmt.Fprintf(&b, "\n%s", strings.TrimSpace(p.Description))
+	}
+	if strings.TrimSpace(p.UsageDescription) != "" {
+		fmt.Fprintf(&b, "\nراهنما: %s", strings.TrimSpace(p.UsageDescription))
+	}
+	if kind == "paid" && len(p.DiscountTiers) > 0 {
+		b.WriteString("\nتخفیف خرید بلندمدت:")
+		for _, tier := range p.DiscountTiers {
+			fmt.Fprintf(&b, "\nاز %d ماه: %s%%", tier.Months, formatBasisPoints(tier.BasisPoints))
+		}
+	}
+	if kind == "test" {
+		b.WriteString("\nسهمیه و تأیید در زمان ثبت درخواست توسط backend بررسی می‌شود.")
+	}
+	return b.String()
+}
+
+func formatBasisPoints(bps int64) string {
+	whole, fraction := bps/100, bps%100
+	if fraction == 0 {
+		return strconv.FormatInt(whole, 10)
+	}
+	return strings.TrimRight(strings.TrimRight(fmt.Sprintf("%d.%02d", whole, fraction), "0"), ".")
+}
+
+func humanDuration(seconds int64) string {
+	if seconds <= 0 {
+		return "نامشخص"
+	}
+	days := seconds / 86400
+	if days > 0 {
+		return fmt.Sprintf("%d روز", days)
+	}
+	hours := seconds / 3600
+	if hours > 0 {
+		return fmt.Sprintf("%d ساعت", hours)
+	}
+	return fmt.Sprintf("%d دقیقه", seconds/60)
+}
+
+func formatIPLimit(ip int) string {
+	if ip == 0 {
+		return "نامحدود"
+	}
+	return strconv.Itoa(ip)
+}
+
+func formatToman(amount int64) string {
+	text := strconv.FormatInt(amount, 10)
+	for i := len(text) - 3; i > 0; i -= 3 {
+		text = text[:i] + "," + text[i:]
+	}
+	return text
+}
+
+func paymentInstructionDetails(instructions paymentInstructions) string {
+	var b strings.Builder
+	if instructions.CardNumber != "" {
+		fmt.Fprintf(&b, "شماره کارت: %s\n", instructions.CardNumber)
+	}
+	if instructions.CardOwner != "" {
+		fmt.Fprintf(&b, "صاحب کارت: %s\n", instructions.CardOwner)
+	}
+	if instructions.Instructions != "" {
+		fmt.Fprintf(&b, "%s\n", instructions.Instructions)
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func validPaymentDestination(instructions paymentInstructions) bool {
+	return strings.TrimSpace(instructions.CardNumber) != "" && strings.TrimSpace(instructions.CardOwner) != ""
+}
+
+func topupInstructionsText(instructions paymentInstructions) string {
+	var b strings.Builder
+	b.WriteString("برای شارژ کیف پول، مبلغ را به تومان وارد کنید. پس از ثبت درخواست، عکس رسید را ارسال کنید.\n\n")
+	b.WriteString(paymentInstructionDetails(instructions))
+	if instructions.MinTopupToman > 0 {
+		fmt.Fprintf(&b, "\nحداقل مبلغ شارژ: %s تومان", formatToman(instructions.MinTopupToman))
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func validateTopupAmount(amount, minimum int64) error {
+	if amount <= 0 {
+		return fmt.Errorf("amount must be positive")
+	}
+	if minimum > 0 && amount < minimum {
+		return fmt.Errorf("minimum top-up is %d", minimum)
+	}
+	return nil
+}
